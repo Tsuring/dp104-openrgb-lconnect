@@ -260,6 +260,8 @@ static int test_host_abi_out_rearm_and_no_local_ack(void)
     CHECK(__dp104_master_state.bridge.waiting);
     CHECK(usb_in_writes == 0); /* No PLC response, no fabricated CAPS ACK. */
     CHECK(uart_status_outside_critical >= 2);
+    CHECK(__dp104_master_state.last_host_frame_word == UINT32_C(0x00ff3100));
+    CHECK(__dp104_master_state.last_tx_frame_word == UINT32_C(0xeeff3100));
     CHECK(uart_write_inside_critical == 0);
     CHECK(assert_irq_balanced() == 0);
     return 0;
@@ -406,6 +408,7 @@ static int test_stream_overflow_and_d1_reset(void)
 static int test_d1_cancels_bytewise_fifo_write(void)
 {
     uint8_t request[DP104_REPORT_BYTES];
+    uint8_t query[DP104_REPORT_BYTES] = {DP104_COMMAND, 0xf4, 0x45, 0};
     uint32_t generation;
 
     reset_fixture();
@@ -418,10 +421,20 @@ static int test_d1_cancels_bytewise_fifo_write(void)
     dp104_master_task_pump();
     CHECK(uart_d1_injected == 1);
     CHECK(uart_output_length == 1);
+    CHECK((__dp104_master_state.last_tx_frame_word >> 24) == 1u);
     CHECK(__dp104_master_state.bridge.generation == generation + 1u);
     CHECK(!__dp104_master_state.bridge.request_ready);
     CHECK(!__dp104_master_state.bridge.waiting);
     CHECK(uart_write_inside_critical == 0);
+    /* D1 cancels after one FIFO byte; the local snapshot preserves that exact
+     * partial-send evidence without resuming the canceled request. */
+    CHECK(host_report(query, 0, 3u, DP104_REPORT_BYTES) == 1);
+    CHECK(__dp104_master_state.bridge.response_ready);
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 16) ==
+          UINT32_C(0x00246202));
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 20) ==
+          UINT32_C(0x01246202));
+    CHECK(uart_output_length == 1);
     CHECK(assert_irq_balanced() == 0);
     return 0;
 }
@@ -518,6 +531,121 @@ static int test_usb_queue_rejects_d1_generation(void)
     return 0;
 }
 
+static int test_master_snapshot(void)
+{
+    uint8_t data[DP104_REPORT_BYTES] = {DP104_COMMAND, DP104_OP_DATA, 0x21, 0, 88};
+    uint8_t query[DP104_REPORT_BYTES] = {DP104_COMMAND, 0xf4, 0x45, 0, 1, 2, 3, 4};
+    uint8_t report[DP104_REPORT_BYTES];
+    uint8_t local_response[DP104_REPORT_BYTES];
+    uint8_t reply_frame[DP104_WIRE_BYTES];
+    uint32_t generation;
+    unsigned sent;
+    size_t reply_length;
+    unsigned i;
+    reset_fixture();
+    CHECK(host_report(data, 0, 3u, sizeof(data)) == 1);
+    generation = __dp104_master_state.bridge.generation;
+    /* Observe a request which is queued but has not reached UART. */
+    __dp104_master_state.uart_stream.used = 7;
+    CHECK(host_report(query, 0, 3u, sizeof(query)) == 1);
+    CHECK(!__dp104_master_state.bridge.request_ready);
+    CHECK(!__dp104_master_state.bridge.waiting);
+    CHECK(__dp104_master_state.bridge.response_ready);
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 16) == UINT32_C(0x00582102));
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 20) == 0);
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 24) == UINT32_C(0x00070001));
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 28) == generation);
+    CHECK(memcmp(__dp104_master_state.bridge.response, query, 8) == 0);
+    CHECK(memcmp(__dp104_master_state.bridge.response + 8, "DP104M4\0", 8) == 0);
+    dp104_master_task_pump(); /* USB busy retains the local response. */
+    CHECK(usb_in_writes == 0 && __dp104_master_state.bridge.response_ready);
+    CHECK(uart_output_length == 0);
+    dp104_master_test_usb_active[3] = 1;
+    dp104_master_task_pump();
+    CHECK(usb_in_writes == 1 && uart_output_length == 0);
+    CHECK(memcmp(usb_retained_copy, query, 8) == 0);
+
+    reset_fixture();
+    CHECK(host_report(data, 0, 3u, sizeof(data)) == 1);
+    dp104_master_task_pump();
+    CHECK(usb_in_writes == 0); /* DATA requires an actual PLC response. */
+    sent = uart_output_length;
+    CHECK(sent == DP104_WIRE_BYTES);
+    generation = __dp104_master_state.bridge.generation;
+    CHECK(host_report(query, 0, 3u, sizeof(query)) == 1);
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 20) == UINT32_C(0xae582102));
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 24) == 2u);
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 28) == generation);
+    /* Updater cancels a pending diagnostic response just like a PLC response. */
+    CHECK(inject_d1(3u) == 0);
+    dp104_master_task_pump();
+    CHECK(!__dp104_master_state.bridge.response_ready);
+    CHECK(uart_output_length == sent && usb_in_writes == 0);
+
+    reset_fixture();
+    CHECK(host_report(data, 0, 3u, sizeof(data)) == 1);
+    dp104_master_task_pump();
+    CHECK(uart_output_length == DP104_WIRE_BYTES);
+    {
+        const uint32_t host_word = __dp104_master_state.last_host_frame_word;
+        const uint32_t tx_word = __dp104_master_state.last_tx_frame_word;
+        const uint8_t non_frame_ops[] = {
+            0xf1u, 0xf2u, 0xf3u, DP104_OP_STATUS, DP104_OP_RELEASE
+        };
+        for(i = 0; i < sizeof(non_frame_ops); ++i)
+        {
+            make_report(report, non_frame_ops[i], (uint8_t)(0x50u + i), 0x10);
+            CHECK(host_report(report, 0, 3u, DP104_REPORT_BYTES) == 1);
+            dp104_master_task_pump();
+            CHECK(__dp104_master_state.last_host_frame_word == host_word);
+            CHECK(__dp104_master_state.last_tx_frame_word == tx_word);
+        }
+    }
+    memset(query, 0, sizeof(query));
+    query[0] = DP104_COMMAND;
+    query[1] = 0xf4u;
+    query[2] = 0x45u;
+    CHECK(host_report(query, 0, 3u, sizeof(query)) == 1);
+    CHECK(__dp104_master_state.bridge.response_ready);
+    memcpy(local_response, __dp104_master_state.bridge.response,
+           sizeof(local_response));
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 16) ==
+          __dp104_master_state.last_host_frame_word);
+    CHECK(dp104_read32(__dp104_master_state.bridge.response + 20) ==
+          __dp104_master_state.last_tx_frame_word);
+    /* A stale PLC F4-shaped packet cannot replace the local response: F4 is
+     * never sent to the PLC and the bridge is no longer waiting for a reply. */
+    make_report(report, 0xf4u, query[2], 0);
+    CHECK(make_wire(DP104_WIRE_RESPONSE, report, reply_frame, &reply_length));
+    CHECK(!__dp104_master_state.bridge.waiting);
+    dp104_master_uart_rx(reply_frame, (unsigned)reply_length);
+    CHECK(__dp104_master_state.bridge.response_ready);
+    CHECK(memcmp(__dp104_master_state.bridge.response, local_response,
+                 sizeof(local_response)) == 0);
+
+    reset_fixture();
+    CHECK(host_report(data, 0, 3u, sizeof(data)) == 1);
+    generation = __dp104_master_state.bridge.generation;
+    query[2] = 0;
+    CHECK(host_report(query, 0, 3u, sizeof(query)) == 1);
+    CHECK(__dp104_master_state.bridge.generation == generation);
+    query[2] = 0x45;
+    query[31] = 1;
+    CHECK(host_report(query, 0, 3u, sizeof(query)) == 1);
+    CHECK(__dp104_master_state.bridge.generation == generation);
+    query[31] = 0;
+    query[3] = 1;
+    CHECK(host_report(query, 0, 3u, sizeof(query)) == 1);
+    CHECK(__dp104_master_state.bridge.generation == generation);
+    query[3] = 0;
+    CHECK(host_report(query, 0, 3u, sizeof(query) - 1) == 1);
+    CHECK(__dp104_master_state.bridge.generation == generation);
+    CHECK(__dp104_master_state.bridge.request_ready);
+    CHECK(!__dp104_master_state.bridge.response_ready);
+    CHECK(assert_irq_balanced() == 0);
+    return 0;
+}
+
 static int test_nested_custom_csr_restore(void)
 {
     uint8_t request[DP104_REPORT_BYTES];
@@ -555,6 +683,7 @@ int main(void)
     CHECK(test_d1_cancels_bytewise_fifo_write() == 0);
     CHECK(test_usb_retry_retention_and_d1_preserve() == 0);
     CHECK(test_usb_queue_rejects_d1_generation() == 0);
+    CHECK(test_master_snapshot() == 0);
     CHECK(test_nested_custom_csr_restore() == 0);
     puts("master target binding: static RawHID ABI, stream routing, D1 cancellation, and USB lifetime PASS");
     return 0;

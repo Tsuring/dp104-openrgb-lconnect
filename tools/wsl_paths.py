@@ -13,7 +13,7 @@ class WslPathError(RuntimeError):
 def to_wsl_path(path: Path) -> str:
     """Return the absolute Linux path that WSL assigns to ``path``."""
     command = [
-        "wsl.exe", "-d", "Ubuntu", "--", "wslpath", "-a", "-u",
+        "wsl.exe", "-d", "Ubuntu", "--exec", "wslpath", "-a", "-u",
         str(path.resolve()),
     ]
     try:

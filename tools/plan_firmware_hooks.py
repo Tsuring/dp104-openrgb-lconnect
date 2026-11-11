@@ -276,7 +276,14 @@ def make_plan(raw_images, layout, master_code_bytes=0):
              window("master", 0x0001be00, 8, master, "Existing task-side worker call; ABI pending"),
              window("master", 0x0001d722, 12, master, "UART ISR callback; relocation pending"),
              window("plc", 0x0800dd30, 4, plc, "Key setter entry; displaced PC-relative LDR needs relocation"),
-             window("plc", 0x08013a5e, 4, plc, "Existing receive-queue call; ABI pending")]
+             window("plc", 0x08013a5e, 4, plc, "Existing receive-queue call; ABI pending"),
+             window("plc", 0x08017576, 4, plc, "Adjacent USART SR/DR loads; diagnostic replay must preserve registers and flags"),
+             window("plc", 0x0801889a, 4, plc, "RX DMA packed initialization count MOV.W"),
+             window("plc", 0x0801757c, 2, plc, "RX DMA empty-count CMP immediate"),
+             window("plc", 0x0801758e, 4, plc, "RX DMA callback-length RSB.W immediate"),
+             window("plc", 0x08017598, 2, plc, "RX DMA reload-count MOVS immediate"),
+             window("plc", 0x080175b0, 4, plc, "RX ISR callback-buffer pointer literal"),
+             window("plc", 0x08018930, 4, plc, "RX DMA CMAR buffer pointer literal")]
     call_offset = image_offset("master", 0x1be00, 8, master)
     worker_target = rv_call_target(0x1be00, master[call_offset:call_offset + 8])
     require(worker_target == 0x20001a56, "Existing task worker call changed")
@@ -333,6 +340,7 @@ def main():
     plan["inputHashes"] = {role: hashlib.sha256(raw).hexdigest() for role, raw in images.items()}
     plan["sourceHashes"] = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in (Path(__file__), ROOT / "src/firmware/dp104_patch_state.h",
+                                     ROOT / "src/firmware/dp104_plc_diagnostic.h",
                                      ROOT / "src/firmware/dp104_master_bridge.h",
                                      ROOT / "src/firmware/dp104_receiver.h",
                                      ROOT / "src/firmware/dp104_usb_stage.h",

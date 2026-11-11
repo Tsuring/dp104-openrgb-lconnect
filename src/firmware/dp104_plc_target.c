@@ -10,8 +10,37 @@
 #define DP104_PLC_MILLIS_LOW_ADDR     UINT32_C(0x20001d38)
 #define DP104_PLC_KEY_BUFFER_ADDR     UINT32_C(0x20002348)
 #define DP104_PLC_DIRTY_ADDR          UINT32_C(0x2000252c)
-#define DP104_PLC_UART_DMA_BYTES      72u
+#define DP104_PLC_UART_DMA_BYTES      DP104_PLC_RX_DMA_BYTES
 #define DP104_PLC_RECEIVER_SNAPSHOT_OP 0xf3u
+
+#define DP104_PLC_STATIC_ASSERT(name, expression) \
+    typedef char name[(expression) ? 1 : -1]
+
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_sr_after_stream,
+    offsetof(dp104_plc_patch_state, rx_sr_before_dr) ==
+    offsetof(dp104_plc_patch_state, uart_stream) + sizeof(dp104_wire_stream));
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_cndtr_after_sr,
+    offsetof(dp104_plc_patch_state, rx_cndtr_after_dr) ==
+    offsetof(dp104_plc_patch_state, rx_sr_before_dr) + sizeof(uint32_t));
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_count_after_cndtr,
+    offsetof(dp104_plc_patch_state, rx_sample_count) ==
+    offsetof(dp104_plc_patch_state, rx_cndtr_after_dr) + sizeof(uint32_t));
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_buffer_capacity,
+    sizeof(((dp104_plc_patch_state *)0)->rx_dma_buffer) == DP104_PLC_UART_DMA_BYTES);
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_buffer_alignment,
+    offsetof(dp104_plc_patch_state, rx_dma_buffer) % 4u == 0);
+#ifndef DP104_PLC_HOST_TEST
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_sr_target_offset,
+    offsetof(dp104_plc_patch_state, rx_sr_before_dr) == 8896u);
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_cndtr_target_offset,
+    offsetof(dp104_plc_patch_state, rx_cndtr_after_dr) == 8900u);
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_count_target_offset,
+    offsetof(dp104_plc_patch_state, rx_sample_count) == 8904u);
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_buffer_target_offset,
+    offsetof(dp104_plc_patch_state, rx_dma_buffer) == 11112u);
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_owned_target_bytes,
+    sizeof(dp104_plc_patch_state) == 11240u);
+#endif
 
 extern dp104_plc_patch_state __dp104_plc_state;
 
@@ -153,7 +182,10 @@ int dp104_plc_target_init(void)
 
     /* The initializer is called after startup BSS zeroing; publish magic last. */
     state->initialized = 0;
-    memset(state, 0, sizeof(*state));
+    /* BSS startup already zeroed the complete reservation. A peripheral
+     * constructor may have armed RX DMA before this application-entry hook;
+     * preserve any bytes it has already received in the dedicated buffer. */
+    memset(state, 0, offsetof(dp104_plc_patch_state, rx_dma_buffer));
     dp104_wire_stream_init(&state->uart_stream);
     if(!dp104_twiddle_rebuild(state->twiddle, DP104_TWIDDLE_WORDS,
                               __dp104_twiddle_basis, DP104_TWIDDLE_WORDS))
@@ -200,16 +232,24 @@ void dp104_plc_uart_rx(const uint8_t *data, uint32_t length)
 {
     dp104_plc_patch_state *state = &__dp104_plc_state;
     uint32_t primask = irq_save();
+    uint16_t stream_used_before = state->uart_stream.used;
+    uint8_t push_failed = 0;
 
-    /* The DMA buffer is 72 bytes. On an invalid callback, drop the partial
+    /* The owned DMA buffer is 128 bytes. On an invalid callback, drop the partial
      * stream and wait for the next unambiguous direction prefix. */
     if(length > DP104_PLC_UART_DMA_BYTES || (length && !data))
     {
         state->uart_stream.used = 0;
         state->uart_stream.dropping = 1;
+        push_failed = 1;
     }
     else
-        (void)dp104_wire_stream_push(&state->uart_stream, data, length);
+        push_failed = !dp104_wire_stream_push(&state->uart_stream, data, length);
+
+    dp104_plc_diagnostic_on_rx(&state->diagnostic, data, length,
+        state->rx_sr_before_dr, state->rx_cndtr_after_dr,
+        state->rx_sample_count, stream_used_before,
+        state->uart_stream.used, push_failed);
 
     irq_restore(primask);
 }
@@ -377,6 +417,14 @@ static void process_request(dp104_plc_patch_state *state,
         return;
     }
     if(request[0] == DP104_COMMAND &&
+       request[1] == DP104_PLC_DIAGNOSTIC_OP)
+    {
+        const uint32_t primask = irq_save();
+        dp104_plc_diagnostic_handle(&state->diagnostic, request, response);
+        irq_restore(primask);
+        return;
+    }
+    if(request[0] == DP104_COMMAND &&
        (request[1] == DP104_PLC_CAL_RAW_PULSE ||
         request[1] == DP104_PLC_CAL_SET_ORDER))
     {
@@ -406,7 +454,53 @@ typedef struct dp104_route_context {
     uint32_t now_ms;
     unsigned legacy_length;
     int legacy_overflow;
+    size_t extension_bytes;
+    size_t input_bytes;
+    uint16_t stream_used_before;
+    uint16_t stream_used_after;
+    uint8_t dropping_before;
+    uint8_t dropping_after;
 } dp104_route_context;
+
+static uint16_t receiver_received_led_count(const dp104_receiver *receiver)
+{
+    unsigned i, bit;
+    uint16_t count = 0;
+    for(i = 0; i < sizeof(receiver->received); ++i)
+        for(bit = 0; bit < 8u; ++bit)
+            if(receiver->received[i] & (uint8_t)(1u << bit)) ++count;
+    return count;
+}
+
+static void note_diagnostic_extension(dp104_plc_patch_state *state,
+                                     const uint8_t request[DP104_REPORT_BYTES],
+                                     uint16_t wire_bytes,
+                                     uint16_t stream_used_before,
+                                     uint16_t stream_used_after,
+                                     uint8_t dropping_before,
+                                     uint8_t dropping_after)
+{
+    uint32_t primask = irq_save();
+    dp104_plc_diagnostic_note_extension(&state->diagnostic, request,
+        wire_bytes, stream_used_before, stream_used_after,
+        dropping_before, dropping_after);
+    dp104_plc_diagnostic_note_decoded(&state->diagnostic, request);
+    irq_restore(primask);
+}
+
+static void note_diagnostic_parser(dp104_plc_patch_state *state, uint8_t event,
+                                  uint16_t bytes,
+                                  uint16_t stream_used_before,
+                                  uint16_t stream_used_after,
+                                  uint8_t dropping_before,
+                                  uint8_t dropping_after)
+{
+    uint32_t primask = irq_save();
+    dp104_plc_diagnostic_note_parser(&state->diagnostic, event, bytes,
+        stream_used_before, stream_used_after, dropping_before,
+        dropping_after);
+    irq_restore(primask);
+}
 
 static void extension_sink(void *context, const uint8_t *frame, size_t length)
 {
@@ -415,13 +509,44 @@ static void extension_sink(void *context, const uint8_t *frame, size_t length)
     uint8_t response[DP104_REPORT_BYTES];
     uint8_t reply[DP104_WIRE_BYTES];
     size_t reply_length;
+    size_t encoded_length = 0;
+    uint16_t commit_received_leds = 0;
+    int encoded;
     if(!dp104_wire_decode(DP104_WIRE_REQUEST, frame, length,
                           request, sizeof(request)))
         return;
+    route->extension_bytes += length;
+    if(request[1] <= DP104_OP_COMMIT)
+        note_diagnostic_extension(route->state, request,
+            (uint16_t)length, (uint16_t)route->stream_used_before,
+            (uint16_t)route->stream_used_after, route->dropping_before,
+            route->dropping_after);
+    if(request[1] == DP104_OP_COMMIT)
+        commit_received_leds =
+            receiver_received_led_count(&route->state->receiver);
     process_request(route->state, request, response, route->now_ms);
-    if(dp104_wire_encode(DP104_WIRE_RESPONSE, response, sizeof(response),
-                         reply, sizeof(reply)) &&
-       (reply_length = dp104_wire_frame_size(reply, sizeof(reply))) != 0)
+    if(request[1] == DP104_OP_COMMIT)
+    {
+        const uint32_t primask = irq_save();
+        dp104_plc_diagnostic_note_commit(&route->state->diagnostic, request,
+            response[3], commit_received_leds);
+        irq_restore(primask);
+    }
+    encoded = dp104_wire_encode(DP104_WIRE_RESPONSE, response,
+                                sizeof(response), reply, sizeof(reply));
+    if(encoded)
+    {
+        encoded_length = dp104_wire_frame_size(reply, sizeof(reply));
+        if(!encoded_length) encoded = 0;
+    }
+    if(request[1] <= DP104_OP_COMMIT)
+    {
+        const uint32_t primask = irq_save();
+        dp104_plc_diagnostic_note_reply(&route->state->diagnostic, request,
+            response[3], encoded, (uint16_t)encoded_length);
+        irq_restore(primask);
+    }
+    if(encoded && (reply_length = encoded_length) != 0)
     {
         /* The master RX ISR drains seven-byte groups and may not signal an
          * idle tail when a response ends exactly on that boundary. Append a
@@ -442,6 +567,13 @@ static void extension_sink(void *context, const uint8_t *frame, size_t length)
          * synchronous completion with stock asynchronous sends skips that
          * cleanup because mode 0 leaves EN set but no busy marker. */
         uart_send(reply, (uint32_t)reply_length, 1);
+        if(request[1] <= DP104_OP_COMMIT)
+        {
+            const uint32_t primask = irq_save();
+            dp104_plc_diagnostic_note_uart_send(&route->state->diagnostic,
+                request, response[3], (uint32_t)reply_length, 1u);
+            irq_restore(primask);
+        }
     }
 }
 
@@ -475,6 +607,8 @@ void dp104_plc_queue_hook(uint8_t **out)
     unsigned length, i;
     size_t stream_length = 0;
     uint8_t stream_is_extension = 0;
+    uint16_t stream_used_before, stream_used_after;
+    uint8_t dropping_before, dropping_after;
     int stream_result;
     dp104_plc_patch_state *state = &__dp104_plc_state;
 
@@ -489,9 +623,24 @@ void dp104_plc_queue_hook(uint8_t **out)
     /* Parse/copy one raw-stream record while IRQs are excluded. If it is
      * incomplete, retain it and consult the original queue as a fallback. */
     primask = irq_save();
+    stream_used_before = state->uart_stream.used;
+    dropping_before = state->uart_stream.dropping;
     stream_result = dp104_wire_stream_next(&state->uart_stream, local_batch,
                                            DP104_PLC_QUEUE_DATA_BYTES,
                                            &stream_length, &stream_is_extension);
+    stream_used_after = state->uart_stream.used;
+    dropping_after = state->uart_stream.dropping;
+    if(stream_result <= 0 &&
+       (stream_used_before != stream_used_after ||
+        dropping_before != dropping_after))
+    {
+        const uint16_t discarded = stream_used_before > stream_used_after ?
+            (uint16_t)(stream_used_before - stream_used_after) : 0;
+        dp104_plc_diagnostic_note_parser(&state->diagnostic,
+            DP104_PLC_DIAG_PARSER_DISCARD, discarded,
+            stream_used_before, stream_used_after, dropping_before,
+            dropping_after);
+    }
     if(stream_result <= 0)
     {
         /* The stock queue slot can be reused immediately after IRQ restore. */
@@ -513,6 +662,12 @@ void dp104_plc_queue_hook(uint8_t **out)
             route.now_ms = now_ms;
             route.legacy_length = 0;
             route.legacy_overflow = 0;
+            route.extension_bytes = 0;
+            route.input_bytes = stream_length;
+            route.stream_used_before = stream_used_before;
+            route.stream_used_after = stream_used_after;
+            route.dropping_before = dropping_before;
+            route.dropping_after = dropping_after;
             extension_sink(&route, local_batch, stream_length);
         }
         else
@@ -543,8 +698,23 @@ void dp104_plc_queue_hook(uint8_t **out)
         route.now_ms = now_ms;
         route.legacy_length = 0;
         route.legacy_overflow = 0;
+        route.extension_bytes = 0;
+        route.input_bytes = length;
+        route.stream_used_before = 0;
+        route.stream_used_after = 0;
+        route.dropping_before = 0;
+        route.dropping_after = 0;
         (void)dp104_wire_route_batch(DP104_WIRE_REQUEST, local_batch, length,
                                      extension_sink, legacy_sink, &route);
+        if(route.input_bytes > route.legacy_length + route.extension_bytes)
+        {
+            const size_t discarded = route.input_bytes -
+                                     route.legacy_length -
+                                     route.extension_bytes;
+            note_diagnostic_parser(state,
+                DP104_PLC_DIAG_PARSER_BATCH_DISCARD,
+                (uint16_t)discarded, 0, 0, 0, 0);
+        }
         if(route.legacy_overflow)
         {
             /* This cannot occur for a 67-byte input batch; preserve a bounded

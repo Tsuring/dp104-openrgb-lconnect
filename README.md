@@ -8,6 +8,8 @@ L-Connect 3 → OpenRGB → DP104 master → PLC → 104 key LEDs
 
 This is an experimental source project for a custom OpenRGB build and a matching patched firmware pair. Stock DP104 firmware does not implement the required protocol. The adapter is compiled into OpenRGB; it is not a loadable plugin or an upstream OpenRGB feature.
 
+**Known issue:** typing-related receive timeouts remain reproducible. The 128-byte RX buffer correction is insufficient for every continuous burst; this is not yet a stable firmware release.
+
 ## Features
 
 - A real HID detector that registers the keyboard only after an end-to-end PLC capability check.
@@ -100,19 +102,22 @@ The first command inventories the exact interface; `--query` sends a capability 
 
 ## Validation status
 
-The following results were recorded on the tested unit on **2026-11-11**:
+The following results were recorded on the tested unit on **2026-11-11 and 2026-11-12**:
 
 | Check | Result |
 | --- | --- |
 | Master/PLC application queries | Both report 1.2.1; end-to-end CAPS and complete-frame ACKs confirmed |
 | Native L-Connect observation | 180 samples over about three minutes; 4,287 additional completed frames, zero frame or exchange failures |
-| Firmware varied-frame regression | 1,223 frames / 19,624 exchanges in 60 seconds; no retries or foreign reports |
+| RX128 firmware regression (2026-11-12) | 1,286 frames / 19,300 exchanges in 60 seconds; zero retries, foreign reports or failed exchanges; 16 ms maximum observed reply |
+| PLC receive diagnostics | 128-byte capacity observed; zero DMA-full callbacks, FIFO push failures or parser-discard bytes during that run |
+| Follow-up native typing observations | Three new DATA timeouts in one three-minute run; one in a second coupled run; automatic recovery succeeded |
+| No-gap transport stress | Failed after 1,600 frames / 24,011 exchanges; 128-byte DMA-full event and 44 parser-discard bytes captured |
 | Zero-heavy and bare-marker regressions | 248 completed frames each |
 | Native fault tests | Fresh CAPS, newest-frame recovery, retry/window limits and interruptible shutdown passed |
 | Physical confirmation | Wave and color/brightness/speed/direction changes remain active |
 | Existing functions | User confirmed keyboard input, upper display, RAM/GPU/GC575 RGB and 8.8-inch screen/sensors remain normal |
 
-The native observation did not encounter a fault, so recovery behavior is supported by the mock fault tests rather than a live fault-recovery event. Earlier builds exposed a same-process worker stop; the current bounded recovery policy addresses that behavior. Detailed observations and remaining unknowns are in [the architecture record](docs/architecture.md).
+The first native observation above predates the RX128 fix. Later typing tests exposed actual UART receive loss and temporary fallback to the stock effect. Master/PLC diagnostics localized a saturated 72-byte PLC DMA batch and subsequent parser desynchronization. The current PLC source relocates that RX buffer into owned 128-byte storage and updates every RX count/reload site while preserving TX configuration. The post-fix firmware run passed, but a subsequent three-minute native L-Connect observation recorded three additional DATA timeouts and recoveries while completing 4,145 frames. RX128 has not yet established a complete fix for typing-related interruptions. See [the architecture record](docs/architecture.md) for the direct observations, causal inference and remaining limits.
 
 Real-time 8K polling, maximum heap/stack demand, flash readback, independent recovery of a corrupted PLC and unlimited runtime are not established. Firmware recovery must be understood before hardware experimentation. Flashing, installation, profile migration and update-maintenance operation scripts are kept outside the published source.
 

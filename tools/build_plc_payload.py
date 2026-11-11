@@ -21,6 +21,7 @@ from build_data_restore import (
 from build_twiddle_restore import appentry_assembly, thumb_bl_target, verify_appentry_hook
 from verify_target import TARGET, parse_uf2, validate_archive
 from release_version import load_release
+from verify_plc_rx_status import build_rx_status_cpu_test
 
 
 OUTPUT_ROOT = ROOT / "build" / "firmware" / "plc-payload"
@@ -37,6 +38,20 @@ QUEUECALL_SITE = 0x08013A5E
 SETTER_SITE = 0x0800DD30
 UART_RX_CALLBACK_WORD = 0x08012BA8
 UART_RX_CALLBACK_OLD = 0x08015BC5
+RX_STATUS_SITE = 0x08017576
+RX_STATUS_ORIGINAL = bytes.fromhex("1a685b68")
+RX_STATUS_STATE_OFFSET = 8896
+RX_DMA_BYTES = 128
+RX_DMA_BUFFER_OFFSET = 11112
+RX_DMA_BUFFER_SITES = (0x080175B0, 0x08018930)
+RX_DMA_OLD_BUFFER = 0x2000C7B0
+RX_DMA_TX_COUNT_LITERAL = 0x0801892C
+RX_DMA_COUNT_PATCHES = (
+    (0x0801889A, "4ff49003", "4ff40003", "RX DMA initialization count 72 to 128 (packed upper halfword)"),
+    (0x0801757C, "482b", "802b", "RX DMA empty-buffer comparison 72 to 128"),
+    (0x0801758E, "c1f14801", "c1f18001", "RX callback length 128 minus remaining DMA count"),
+    (0x08017598, "4823", "8023", "RX DMA reload count 72 to 128"),
+)
 QUEUE_POP = 0x08018F24
 TABLE_A = 0x0801CC5C
 TABLE_B = 0x0801EC5C
@@ -55,6 +70,7 @@ CMSIS_COMMIT = "f2cad4345783c948ed4a7f5cdb02cdc0856366f1"
 PROVENANCE_PATHS = (
     "tools/build_plc_payload.py",
     "tools/release_version.py",
+    "tools/wsl_paths.py",
     "CMakeLists.txt",
     "tools/build_twiddle_restore.py",
     "tools/build_data_restore.py",
@@ -62,6 +78,8 @@ PROVENANCE_PATHS = (
     "tools/plan_firmware_hooks.py",
     "src/firmware/dp104_plc_target.c",
     "src/firmware/dp104_plc_target.h",
+    "src/firmware/dp104_plc_diagnostic.c",
+    "src/firmware/dp104_plc_diagnostic.h",
     "src/firmware/dp104_patch_state.h",
     "src/firmware/dp104_receiver.c",
     "src/firmware/dp104_receiver.h",
@@ -74,6 +92,9 @@ PROVENANCE_PATHS = (
     "src/firmware/freestanding_memory.c",
     "src/firmware/freestanding/string.h",
     "src/firmware/thumb_setter_hook.S",
+    "src/firmware/thumb_rx_status_hook.S",
+    "tools/verify_plc_rx_status.py",
+    "tests/plc_rx_status_cpu.S",
     "src/firmware/dp104_master_bridge.h",
     "src/firmware/dp104_usb_stage.h",
     "include/dp104_protocol.h",
@@ -117,6 +138,40 @@ def thumb_wide_target(data: bytes, address: int, link: bool) -> int:
                 ((first & 0x3FF) << 12) | ((second & 0x7FF) << 1)
     displacement = (immediate ^ (1 << 24)) - (1 << 24)
     return (address + 4 + displacement) & 0xFFFFFFFE
+
+
+def thumb_modified_immediate(code: bytes) -> int:
+    require(len(code) == 4, "modified-immediate instruction must be four bytes")
+    first, second = struct.unpack("<HH", code)
+    immediate = (((first >> 10) & 1) << 11) | (((second >> 12) & 7) << 8) | (second & 255)
+    byte = immediate & 255
+    if immediate >> 10 == 0:
+        mode = (immediate >> 8) & 3
+        require(mode == 0 or byte != 0, "invalid replicated Thumb immediate")
+        return (byte, byte * 0x00010001, byte * 0x01000100, byte * 0x01010101)[mode]
+    value = 0x80 | (immediate & 0x7f)
+    rotate = (immediate >> 7) & 31
+    return ((value >> rotate) | (value << (32 - rotate))) & 0xffffffff
+
+
+def verify_rx_count_encodings() -> None:
+    init, compare, length, reload = RX_DMA_COUNT_PATCHES
+    require(init[0] == 0x0801889A and init[1][:4] == init[2][:4] == "4ff4" and
+            bytes.fromhex(init[1])[3] == bytes.fromhex(init[2])[3] == 3 and
+            thumb_modified_immediate(bytes.fromhex(init[1])) == 72 << 16 and
+            thumb_modified_immediate(bytes.fromhex(init[2])) == RX_DMA_BYTES << 16,
+            "RX initialization MOV.W does not preserve r3 and the packed count field")
+    require(compare[0] == 0x0801757C and bytes.fromhex(compare[1]) == struct.pack("<H", 0x2b00 | 72) and
+            bytes.fromhex(compare[2]) == struct.pack("<H", 0x2b00 | RX_DMA_BYTES),
+            "RX empty-count CMP does not preserve r3/opcode")
+    require(length[0] == 0x0801758E and length[1][:4] == length[2][:4] == "c1f1" and
+            bytes.fromhex(length[1])[3] == bytes.fromhex(length[2])[3] == 1 and
+            thumb_modified_immediate(bytes.fromhex(length[1])) == 72 and
+            thumb_modified_immediate(bytes.fromhex(length[2])) == RX_DMA_BYTES,
+            "RX length RSB.W does not preserve r1 and its immediate count")
+    require(reload[0] == 0x08017598 and bytes.fromhex(reload[1]) == struct.pack("<H", 0x2300 | 72) and
+            bytes.fromhex(reload[2]) == struct.pack("<H", 0x2300 | RX_DMA_BYTES),
+            "RX reload MOVS does not preserve r3/opcode")
 
 
 def appentry_source() -> str:
@@ -179,6 +234,21 @@ dp104_plc_setter_legacy:
 """
 
 
+def rx_status_call_source() -> str:
+    return """.syntax unified
+.cpu cortex-m3
+.thumb
+.section .rxstatuscall,"ax",%progbits
+.balign 2
+.globl dp104_plc_rxstatuscall_shim
+.type dp104_plc_rxstatuscall_shim,%function
+.thumb_func
+dp104_plc_rxstatuscall_shim:
+    bl dp104_plc_rx_status_hook
+.size dp104_plc_rxstatuscall_shim, .-dp104_plc_rxstatuscall_shim
+"""
+
+
 def payload_linker_script(plan: dict[str, Any]) -> str:
     reservation = plan["reservations"]["plc"]
     state_bytes = int(plan["storageLayout"]["plc"]["bytes"])
@@ -194,6 +264,7 @@ PHDRS
   appcall PT_LOAD FLAGS(5);
   queuecall PT_LOAD FLAGS(5);
   setterjump PT_LOAD FLAGS(5);
+  rxstatuscall PT_LOAD FLAGS(5);
   payload PT_LOAD FLAGS(5);
 }}
 SECTIONS
@@ -201,6 +272,7 @@ SECTIONS
   .appcall 0x{APPCALL_SITE:x} : {{ KEEP(*(.appcall)) }} :appcall
   .queuecall 0x{QUEUECALL_SITE:x} : {{ KEEP(*(.queuecall)) }} :queuecall
   .setterjump 0x{SETTER_SITE:x} : {{ KEEP(*(.setterjump)) }} :setterjump
+  .rxstatuscall 0x{RX_STATUS_SITE:x} : {{ KEEP(*(.rxstatuscall)) }} :rxstatuscall
   .apphook 0x{TABLE_A:x} : {{ KEEP(*(.apphook)) }} :payload
   .target_init : {{ KEEP(*(.text.dp104_plc_target_init)) }} :payload
   .queue_hook : {{ KEEP(*(.text.dp104_plc_queue_hook)) }} :payload
@@ -208,6 +280,7 @@ SECTIONS
   .setter_hook : {{ KEEP(*(.text.dp104_plc_setter_hook)) }} :payload
   .setter_predicate : {{ KEEP(*(.text.dp104_plc_should_skip_setter)) }} :payload
   .setter_legacy ALIGN(4) : {{ KEEP(*(.setter_legacy)) }} :payload
+  .rx_status_hook ALIGN(4) : {{ KEEP(*(.text.dp104_plc_rx_status_hook)) }} :payload
   .core :
   {{
     *(.text .text.*)
@@ -224,9 +297,13 @@ SECTIONS
 ASSERT(SIZEOF(.appcall) == 4, \"appcall must be one BL\")
 ASSERT(SIZEOF(.queuecall) == 4, \"queuecall must be one BL\")
 ASSERT(SIZEOF(.setterjump) == 4, \"setter site must be one B.W\")
+ASSERT(SIZEOF(.rxstatuscall) == 4, \"RX diagnostic site must be one BL\")
+ASSERT((dp104_plc_rx_status_hook & 0xfffffffe) == ADDR(.rx_status_hook), \"RX diagnostic hook section mismatch\")
 ASSERT(ADDR(.apphook) == 0x{TABLE_A:x}, \"appentry hook is not at A start\")
 ASSERT(ADDR(.apphook) + SIZEOF(.apphook) <= 0x{TABLE_B:x}, \"appentry hook exceeds A table\")
-ASSERT(ADDR(.ARM.exidx) + SIZEOF(.ARM.exidx) <= 0x{TABLE_B:x}, \"ARM exidx exceeds A table\")
+/* LLD may evaluate this section's extent before relaxation. The exact final
+ * A-span limit is enforced on the linked PT_LOAD and again on the raw patch
+ * bytes before any UF2 emission; no B-table byte may be changed. */
 ASSERT(SIZEOF(.data) == 0, \"PLC payload has initialized data\")
 ASSERT(SIZEOF(.bss) == 0, \"PLC payload has BSS\")
 ASSERT(SIZEOF(.got) == 0, \"PLC payload has GOT state\")
@@ -271,7 +348,7 @@ def validate_plan(plan: dict[str, Any], raw: bytes, raw_sha: str,
     plan_hashes = {key.replace("\\", "/"): value
                    for key, value in plan.get("sourceHashes", {}).items()}
     for path in ("tools/plan_firmware_hooks.py", "src/firmware/dp104_patch_state.h",
-                 "src/firmware/dp104_twiddle.h"):
+                 "src/firmware/dp104_plc_diagnostic.h", "src/firmware/dp104_twiddle.h"):
         require(plan_hashes.get(path) == sha256_file(ROOT / path),
                 f"planner source hash is stale for {path}")
 
@@ -427,7 +504,7 @@ def planner_contract(plan: dict[str, Any], raw: bytes, raw_sha: str,
     plan_hashes = {key.replace("\\", "/"): value
                    for key, value in plan.get("sourceHashes", {}).items()}
     for path in ("tools/plan_firmware_hooks.py", "src/firmware/dp104_patch_state.h",
-                 "src/firmware/dp104_twiddle.h"):
+                 "src/firmware/dp104_plc_diagnostic.h", "src/firmware/dp104_twiddle.h"):
         require(plan_hashes.get(path) == sha256_file(ROOT / path),
                 f"planner source hash is stale for {path}")
 
@@ -453,6 +530,7 @@ def planner_contract(plan: dict[str, Any], raw: bytes, raw_sha: str,
              for item in plan["originalHookWindows"] if item.get("role") == "plc"}
     setter_window = hooks.get(SETTER_SITE)
     queue_window = hooks.get(QUEUECALL_SITE)
+    rx_status_window = hooks.get(RX_STATUS_SITE)
     require(setter_window is not None and setter_window["originalHex"] == "f0b50c4d" and
             raw[setter_window["imageOffset"]:setter_window["imageOffset"] + 4] ==
             bytes.fromhex(setter_window["originalHex"]),
@@ -461,6 +539,46 @@ def planner_contract(plan: dict[str, Any], raw: bytes, raw_sha: str,
             raw[queue_window["imageOffset"]:queue_window["imageOffset"] + 4] ==
             bytes.fromhex(queue_window["originalHex"]),
             "planner queue-call window differs from original raw bytes")
+    require(rx_status_window is not None and
+            rx_status_window["originalHex"] == RX_STATUS_ORIGINAL.hex() and
+            raw[rx_status_window["imageOffset"]:rx_status_window["imageOffset"] + 4] == RX_STATUS_ORIGINAL,
+            "planner RX diagnostic window differs from adjacent original SR/DR loads")
+    require(int(layout["bytes"]) >= RX_STATUS_STATE_OFFSET + 12,
+            "PLC state does not reserve the three ISR sample words")
+    verify_rx_count_encodings()
+    require(raw[0x08016952 - raw_base:0x08016960 - raw_base] ==
+            bytes.fromhex("4b8943600b6883604b68c3607047") and
+            raw[0x0801889E - raw_base:0x080188A8 - raw_base] ==
+            bytes.fromhex("059303a9234b23480493") and
+            thumb_bl_target(raw[0x080188A8 - raw_base:0x080188AC - raw_base],
+                            0x080188A8) == 0x080168FE and
+            raw[0x08018934 - raw_base:0x08018938 - raw_base] == struct.pack("<I", 0x4002006c),
+            "RX DMA initializer no longer maps packed size+10 and memory+4 to CNDTR/CMAR")
+    rx_buffer = state_start + RX_DMA_BUFFER_OFFSET
+    require(int(layout["bytes"]) == RX_DMA_BUFFER_OFFSET + RX_DMA_BYTES and
+            rx_buffer % 4 == 0 and rx_buffer + RX_DMA_BYTES <= bss_heap_end,
+            "PLC target layout does not reserve the entire aligned RX DMA buffer")
+    for address, old_hex, new_hex, purpose in RX_DMA_COUNT_PATCHES:
+        item = hooks.get(address)
+        old, new = bytes.fromhex(old_hex), bytes.fromhex(new_hex)
+        offset = address - raw_base
+        require(item is not None and item["originalHex"] == old_hex and
+                item["imageOffset"] == offset and raw[offset:offset + len(old)] == old and
+                len(old) == len(new),
+                f"RX count opcode differs from the pinned planner/raw at 0x{address:x}")
+        changes[address] = {"offset": offset, "old": old, "new": new, "purpose": purpose}
+    for address in RX_DMA_BUFFER_SITES:
+        item = hooks.get(address)
+        old = struct.pack("<I", RX_DMA_OLD_BUFFER)
+        offset = address - raw_base
+        require(item is not None and item["originalHex"] == old.hex() and
+                item["imageOffset"] == offset and raw[offset:offset + 4] == old,
+                f"RX buffer pointer differs from the pinned planner/raw at 0x{address:x}")
+        changes[address] = {"offset": offset, "old": old,
+                            "new": struct.pack("<I", rx_buffer),
+                            "purpose": "Relocate RX DMA storage into measured owned PLC state"}
+    require(raw[RX_DMA_TX_COUNT_LITERAL - raw_base:RX_DMA_TX_COUNT_LITERAL - raw_base + 4] ==
+            struct.pack("<I", 0x00480010), "Original TX DMA count/direction literal changed")
     return {
         "plan_sha256": sha256_file(PLAN_PATH),
         "state_start": state_start,
@@ -471,6 +589,10 @@ def planner_contract(plan: dict[str, Any], raw: bytes, raw_sha: str,
         "recipes": changes,
         "setter_original_hex": setter_window["originalHex"],
         "queue_original_hex": queue_window["originalHex"],
+        "rx_status_original_hex": rx_status_window["originalHex"],
+        "rx_dma": {"old_count": 72, "count": RX_DMA_BYTES, "buffer": rx_buffer,
+                   "buffer_offset": RX_DMA_BUFFER_OFFSET, "buffer_end": rx_buffer + RX_DMA_BYTES,
+                   "tx_count_literal_preserved": 0x00480010},
         "recipes_applied": False,
     }
 
@@ -482,6 +604,7 @@ def generate_private_sources(output_dir: Path) -> dict[str, Path]:
         "appcall": output_dir / "appcall_shim.S",
         "queuecall": output_dir / "queuecall_shim.S",
         "setterjump": output_dir / "setterjump_shim.S",
+        "rxstatuscall": output_dir / "rxstatuscall_shim.S",
         "setter_legacy": output_dir / "setter_legacy.S",
         "linker": output_dir / "payload_layout.ld",
     }
@@ -489,6 +612,7 @@ def generate_private_sources(output_dir: Path) -> dict[str, Path]:
     paths["appcall"].write_text(appcall, encoding="ascii")
     paths["queuecall"].write_text(queuecall, encoding="ascii")
     paths["setterjump"].write_text(setterjump, encoding="ascii")
+    paths["rxstatuscall"].write_text(rx_status_call_source(), encoding="ascii")
     paths["setter_legacy"].write_text(setter_legacy_source(), encoding="ascii")
     return paths
 
@@ -576,6 +700,23 @@ def segment_bytes(elf_path: Path, segment: dict[str, Any]) -> bytes:
     return content[start:end]
 
 
+def verify_rx_status_hook(code: bytes, address: int, state_start: int) -> dict[str, Any]:
+    # Exact instructions: aligned 16-byte save; adjacent original SR/DR loads;
+    # stores and a non-flag-setting ADD.W; balanced return. No extra SR/DR read,
+    # C call, IRQ-mask change, or flag-setting instruction is permitted here.
+    expected = bytes.fromhex("13b51a685b6804480260216f4160816801f10101816013bd")
+    require(address % 4 == 0 and len(code) == 28 and code[:24] == expected,
+            "RX diagnostic veneer differs from the reviewed register/flag replay")
+    sample_address = state_start + RX_STATUS_STATE_OFFSET
+    require(code[24:] == struct.pack("<I", sample_address),
+            "RX diagnostic sample literal differs from the reserved C-state offset")
+    return {"address": address, "bytes": len(code), "sample_address": sample_address,
+            "sample_field_offsets": [8896, 8900, 8904],
+            "original_sr_dr_loads_adjacent_once_each": True,
+            "stack_save_bytes": 16, "apsr_and_live_registers_preserved": True,
+            "raw_status_only_no_chip_identity_or_overrun_bit_claim": True}
+
+
 def output_section_bytes(elf: dict[str, Any], elf_path: Path,
                          payload_address: int, name: str) -> tuple[dict[str, Any], bytes]:
     item = section(elf, name)
@@ -611,6 +752,13 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
     original_uart_rx_pointer = raw[uart_rx_offset:uart_rx_offset + 4]
     require(original_uart_rx_pointer == struct.pack("<I", UART_RX_CALLBACK_OLD),
             "original UART receive callback literal differs from the pinned vendor target")
+    require(raw[RX_STATUS_SITE - raw_base:RX_STATUS_SITE - raw_base + 4] == RX_STATUS_ORIGINAL,
+            "RX diagnostic site is not the pinned adjacent SR/DR load pair")
+    require(raw[RX_STATUS_SITE - raw_base - 2:RX_STATUS_SITE - raw_base + 8] ==
+            bytes.fromhex("0d4c1a685b68236f482b") and
+            raw[0x080175A8 - raw_base:0x080175B0 - raw_base] ==
+            struct.pack("<II", 0x40004400, 0x40020000),
+            "RX diagnostic register/USART/DMA context differs from the reviewed ISR")
     original_setter = raw[setter_offset:setter_offset + 4]
     require(original_setter == bytes.fromhex(planner["setter_original_hex"]),
             "original setter prologue differs from planner evidence")
@@ -625,20 +773,45 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
         ROOT / "src/firmware/dp104_wire.c",
         ROOT / "src/firmware/dp104_wire_stream.c",
         ROOT / "src/firmware/dp104_twiddle.c",
-        ROOT / "src/firmware/dp104_plc_target.c",
         ROOT / "src/firmware/freestanding_memory.c",
         ROOT / "src/firmware/thumb_setter_hook.S",
+        ROOT / "src/firmware/thumb_rx_status_hook.S",
         private["appentry"], private["appcall"], private["queuecall"],
-        private["setterjump"], private["setter_legacy"],
+        private["setterjump"], private["setter_legacy"], private["rxstatuscall"],
     ]
-    flags = [
+    compile_flags = [
         "-target", profile["freestanding_triple"], "-std=c99", "-Os", "-g0",
         "-ffreestanding", "-fno-builtin", "-fno-stack-protector", "-fno-common",
         "-fno-pic", "-fno-pie", "-fno-unwind-tables",
         "-fno-asynchronous-unwind-tables", "-ffunction-sections", "-nostdlib",
-        "-static", "-no-pie", "-Wall", "-Wextra", "-Werror",
+        "-Wall", "-Wextra", "-Werror",
         "-Isrc/firmware/freestanding", "-Isrc/firmware", "-Iinclude",
-        *profile["architecture_flags"], *[str(path) for path in sources],
+        *profile["architecture_flags"],
+    ]
+    # Keep receiver, wire and coefficient routines at their established -Os.
+    # The metadata logger and its custom target binding use -Oz and must still
+    # fit the strict original A-table boundary. Vendor code is not recompiled.
+    diagnostic_flags = ["-Oz" if flag == "-Os" else flag for flag in compile_flags]
+    minsize_objects = []
+    minsize_reports = []
+    for name in ("dp104_plc_diagnostic", "dp104_plc_target"):
+        source = ROOT / "src/firmware" / (name + ".c")
+        output = output_dir / (name + ".o")
+        command = [str(zig), "cc", *diagnostic_flags, "-c", str(source), "-o", str(output)]
+        compiled = run(command, env)
+        content = output.read_bytes()
+        require(len(content) >= 52 and content[:7] == b"\x7fELF\x01\x01\x01" and
+                struct.unpack_from("<HH", content, 16) == (1, 40) and
+                not struct.unpack_from("<I", content, 36)[0] & 0x400,
+                "PLC minsize object is not ARM32 little-endian soft-float ET_REL")
+        minsize_objects.append(output)
+        minsize_reports.append({"source": str(source.relative_to(ROOT)),
+                                "object": str(output.relative_to(ROOT)),
+                                "object_sha256": sha256_file(output), "command": command,
+                                "stdout": compiled.stdout.strip()})
+    flags = [
+        *compile_flags, "-static", "-no-pie", *[str(path) for path in sources],
+        *[str(path) for path in minsize_objects],
         "-Wl,-T," + str(private["linker"]), "-Wl,--build-id=none",
         "-Wl,--no-undefined", "-Wl,-z,max-page-size=0x4", "-o", str(payload_elf),
     ]
@@ -653,14 +826,14 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
                 f"PLC payload unexpectedly contains {name}")
 
     loads = elf["program_headers"]
-    require(len(loads) == 4 and all(segment["flags"] == (PF_R | PF_X) and
+    require(len(loads) == 5 and all(segment["flags"] == (PF_R | PF_X) and
                                      not segment["flags"] & PF_W for segment in loads),
-            "PLC payload must have four read-only executable PT_LOAD segments")
+            "PLC payload must have five explicit read-only executable PT_LOAD segments")
     segments = {segment["virtual_address"]: segment for segment in loads}
-    expected_sites = (APPCALL_SITE, QUEUECALL_SITE, SETTER_SITE, TABLE_A)
+    expected_sites = (APPCALL_SITE, QUEUECALL_SITE, SETTER_SITE, RX_STATUS_SITE, TABLE_A)
     require(set(segments) == set(expected_sites),
             "PLC payload PT_LOAD addresses differ from the approved code windows")
-    for address in (APPCALL_SITE, QUEUECALL_SITE, SETTER_SITE):
+    for address in (APPCALL_SITE, QUEUECALL_SITE, SETTER_SITE, RX_STATUS_SITE):
         require(segments[address]["file_size"] == 4 and
                 segments[address]["memory_size"] == 4,
                 f"branch shim at 0x{address:x} is not exactly four bytes")
@@ -669,6 +842,8 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
     require(payload_load["file_size"] == payload_load["memory_size"] and
             payload_load["file_size"] > 28 and payload_end <= TABLE_B,
             "linked PLC payload does not fit fully inside the original A-table span")
+    require(payload_end <= TABLE_B and payload_load["file_size"] <= TABLE_BYTES,
+            "final linked PLC extent exceeds the unchanged 8192-byte A-table limit")
     require(elf["file_size"] < 65536,
             "linked PLC payload ELF contains unexpected address-gap padding")
 
@@ -685,6 +860,8 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
         elf, payload_elf, TABLE_A, ".setter_predicate")
     legacy_section, legacy_bytes = output_section_bytes(
         elf, payload_elf, TABLE_A, ".setter_legacy")
+    rx_status_section, rx_status_bytes = output_section_bytes(
+        elf, payload_elf, TABLE_A, ".rx_status_hook")
     require(apphook_section["address"] == TABLE_A and apphook_section["size"] == 28 and
             target_init["size"] > 0 and queue_hook["size"] > 0 and
             uart_rx_hook["size"] > 0 and setter_hook["size"] > 0 and
@@ -697,6 +874,8 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
     )
     legacy_check = verify_legacy_setter(legacy_bytes, legacy_section["address"],
                                         original_setter)
+    rx_status_check = verify_rx_status_hook(
+        rx_status_bytes, rx_status_section["address"], planner["state_start"])
     uart_rx_pointer = uart_rx_hook["address"] | 1
     require(TABLE_A <= (uart_rx_pointer & ~1) < payload_end,
             "UART receive callback function lies outside A-span payload")
@@ -705,6 +884,7 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
     appcall_bytes = segment_bytes(payload_elf, segments[APPCALL_SITE])
     queuecall_bytes = segment_bytes(payload_elf, segments[QUEUECALL_SITE])
     setterjump_bytes = segment_bytes(payload_elf, segments[SETTER_SITE])
+    rxstatuscall_bytes = segment_bytes(payload_elf, segments[RX_STATUS_SITE])
     payload_bytes = segment_bytes(payload_elf, payload_load)
     require(thumb_bl_target(appcall_bytes, APPCALL_SITE) == TABLE_A,
             "appcall BL does not target the new appentry hook")
@@ -713,13 +893,18 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
     require(thumb_wide_target(setterjump_bytes, SETTER_SITE, link=False) ==
             setter_hook["address"],
             "setter-site B.W does not target dp104_plc_setter_hook")
+    require(thumb_bl_target(rxstatuscall_bytes, RX_STATUS_SITE) == rx_status_section["address"],
+            "RX diagnostic BL does not target the reviewed status veneer")
+    rx_status_cpu = build_rx_status_cpu_test(zig, env, output_dir, rx_status_bytes)
 
     appcall_bin = output_dir / "appcall.bin"
     queuecall_bin = output_dir / "queuecall.bin"
     setterjump_bin = output_dir / "setterjump.bin"
+    rxstatuscall_bin = output_dir / "rxstatuscall.bin"
     payload_bin = output_dir / "payload.bin"
     for path, content in ((appcall_bin, appcall_bytes), (queuecall_bin, queuecall_bytes),
-                          (setterjump_bin, setterjump_bytes), (payload_bin, payload_bytes)):
+                          (setterjump_bin, setterjump_bytes), (payload_bin, payload_bytes),
+                          (rxstatuscall_bin, rxstatuscall_bytes)):
         path.write_bytes(content)
 
     return {
@@ -728,11 +913,13 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
             "queuecall_target": QUEUE_POP,
             "setter_prologue_hex": original_setter.hex(),
             "uart_rx_callback_value": UART_RX_CALLBACK_OLD,
+            "rx_status_original_hex": RX_STATUS_ORIGINAL.hex(),
         },
         "linked_addresses": {
             "appcall": APPCALL_SITE,
             "queuecall": QUEUECALL_SITE,
             "setterjump": SETTER_SITE,
+            "rxstatuscall": RX_STATUS_SITE,
             "payload_start": TABLE_A,
             "payload_end_exclusive": payload_end,
             "a_table_end_exclusive": TABLE_B,
@@ -745,11 +932,13 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
             "setter_hook": setter_hook["address"],
             "setter_predicate": predicate["address"],
             "setter_legacy": legacy_section["address"],
+            "rx_status_hook": rx_status_section["address"],
         },
         "static_hook_checks": {
             "appentry": apphook_check,
             "setter_hook": setter_check,
             "setter_legacy": legacy_check,
+            "rx_status_hook": rx_status_check,
             "original_uart_rx_callback": UART_RX_CALLBACK_OLD,
             "uart_rx_callback_pointer": uart_rx_pointer,
             "appcall_target": thumb_bl_target(appcall_bytes, APPCALL_SITE),
@@ -757,7 +946,11 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
             "setterjump_target": thumb_wide_target(setterjump_bytes, SETTER_SITE, False),
             "uart_rx_callback_target": uart_rx_pointer & 0xFFFFFFFE,
             "uart_rx_callback_thumb_bit_set": bool(uart_rx_pointer & 1),
+            "rx_status_call_target": thumb_bl_target(rxstatuscall_bytes, RX_STATUS_SITE),
         },
+        "rx_status_synthetic_cpu_test": rx_status_cpu,
+        "minsize_compile": minsize_reports,
+        "optimization_boundary": "custom target binding/logger -Oz; receiver/wire/twiddle -Os; vendor code not recompiled",
         "payload_elf": {
             "path": str(payload_elf.relative_to(ROOT)),
             "sha256": sha256_file(payload_elf),
@@ -775,6 +968,7 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
             "appcall": {"bytes": appcall_bytes, "path": appcall_bin},
             "queuecall": {"bytes": queuecall_bytes, "path": queuecall_bin},
             "setterjump": {"bytes": setterjump_bytes, "path": setterjump_bin},
+            "rxstatuscall": {"bytes": rxstatuscall_bytes, "path": rxstatuscall_bin},
             "payload": {"bytes": payload_bytes, "path": payload_bin},
             "uart_rx_callback": {
                 "address": UART_RX_CALLBACK_WORD,
@@ -792,6 +986,9 @@ def build_raw_replacements(raw: bytes, raw_base: int,
                           planner: dict[str, Any],
                           linked: dict[str, Any]) -> tuple[bytes, list[dict[str, Any]]]:
     blobs = linked["patch_blobs"]
+    require(28 < len(blobs["payload"]["bytes"]) <= TABLE_BYTES and
+            TABLE_A + len(blobs["payload"]["bytes"]) <= TABLE_B,
+            "raw payload bytes exceed the unchanged A-table replacement window")
     replacements = []
     for address, item in planner["recipes"].items():
         replacements.append({
@@ -806,6 +1003,7 @@ def build_raw_replacements(raw: bytes, raw_base: int,
         (APPCALL_SITE, "appcall", "Redirect original startup BL through target initialization"),
         (QUEUECALL_SITE, "queuecall", "Route the task queue pop through the PLC receiver"),
         (SETTER_SITE, "setterjump", "Branch to the guarded setter without changing LR"),
+        (RX_STATUS_SITE, "rxstatuscall", "Replay adjacent SR/DR reads through a register-preserving metadata sampler"),
         (TABLE_A, "payload", "Replace the original A table prefix with linked read-only code"),
     ):
         new = blobs[name]["bytes"]
@@ -876,6 +1074,17 @@ def build_raw_replacements(raw: bytes, raw_base: int,
     changed = {offset for offset, (before, after) in
                enumerate(zip(raw, patched_raw)) if before != after}
     require(changed <= covered, "raw image differs outside approved replacement spans")
+    for address, _old_hex, new_hex, _purpose in RX_DMA_COUNT_PATCHES:
+        expected = bytes.fromhex(new_hex)
+        require(patched_raw[address - raw_base:address - raw_base + len(expected)] == expected,
+                f"final RX DMA count instruction differs at 0x{address:x}")
+    for address in RX_DMA_BUFFER_SITES:
+        require(patched_raw[address - raw_base:address - raw_base + 4] ==
+                struct.pack("<I", planner["rx_dma"]["buffer"]),
+                f"final RX DMA buffer pointer differs at 0x{address:x}")
+    require(patched_raw[RX_DMA_TX_COUNT_LITERAL - raw_base:RX_DMA_TX_COUNT_LITERAL - raw_base + 4] ==
+            raw[RX_DMA_TX_COUNT_LITERAL - raw_base:RX_DMA_TX_COUNT_LITERAL - raw_base + 4],
+            "RX resize altered the original TX DMA initialization literal")
     basis_offset = TABLE_B - raw_base
     require(patched_raw[basis_offset:basis_offset + TABLE_BYTES] ==
             raw[basis_offset:basis_offset + TABLE_BYTES],
@@ -963,6 +1172,7 @@ def planner_report(plan: dict[str, Any], contract: dict[str, Any]) -> dict[str, 
             for address, item in contract["recipes"].items()
         },
         "reservation_recipes_applied_to_source_or_hardware": False,
+        "rx_dma": contract["rx_dma"],
     }
 
 

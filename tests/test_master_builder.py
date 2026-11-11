@@ -18,7 +18,7 @@ class WslPathTests(unittest.TestCase):
         converted = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="/mnt/custom/project/build/sample.elf\n", stderr=""
         )
-        command = ["wsl.exe", "-d", "Ubuntu", "--", "wslpath", "-a", "-u",
+        command = ["wsl.exe", "-d", "Ubuntu", "--exec", "wslpath", "-a", "-u",
                    str(path.resolve())]
 
         with patch.object(wsl_paths.subprocess, "run", return_value=converted) as run:

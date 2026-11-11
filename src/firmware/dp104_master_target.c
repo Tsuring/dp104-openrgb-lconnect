@@ -7,6 +7,7 @@
 #define DP104_MASTER_STATE_MAGIC UINT32_C(0x44504d31) /* "DPM1" */
 #define DP104_MASTER_CSR_MASK UINT32_C(0x00000088)
 #define DP104_MASTER_UPDATE_COMMAND 0xd1u
+#define DP104_MASTER_SNAPSHOT_OP 0xf4u
 
 #define DP104_MASTER_RAW_REPORT_ADDRESS ((uintptr_t)0x200104c0u)
 #define DP104_MASTER_UART_STATUS_ADDRESS ((uintptr_t)0x40003c0bu)
@@ -124,6 +125,8 @@ static void master_initialize_locked(void)
     __dp104_master_state.usb.pending = 0;
     dp104_wire_stream_init(&__dp104_master_state.uart_stream);
     __dp104_master_state.uart_stream_active = 0;
+    __dp104_master_state.last_host_frame_word = 0;
+    __dp104_master_state.last_tx_frame_word = 0;
     ((volatile uint32_t *)&__dp104_master_state.initialized)[0] =
         DP104_MASTER_STATE_MAGIC;
 }
@@ -189,6 +192,7 @@ static int master_send_plc(void *context, const uint8_t *payload,
     uint32_t generation;
     uint32_t saved;
     size_t i;
+    int tracked;
 
     (void)context;
     if(!dp104_wire_encode(DP104_WIRE_REQUEST, payload, length, frame,
@@ -205,6 +209,12 @@ static int master_send_plc(void *context, const uint8_t *payload,
         return 0;
     }
     generation = __dp104_master_state.bridge.generation;
+    tracked = payload[1] <= DP104_OP_COMMIT;
+    if(tracked)
+        __dp104_master_state.last_tx_frame_word =
+            (uint32_t)payload[1] | ((uint32_t)payload[2] << 8) |
+            ((uint32_t)(payload[1] == DP104_OP_DATA ? payload[4] : 0xffu) << 16) |
+            (master_uart_fifo_full() ? UINT32_C(0x40000000) : 0);
     master_irq_leave(NULL, saved);
 
     for(i = 0; i < frame_length; ++i)
@@ -240,6 +250,11 @@ static int master_send_plc(void *context, const uint8_t *payload,
                 continue;
             }
             master_uart_write_byte(frame[i]);
+            if(tracked)
+                __dp104_master_state.last_tx_frame_word =
+                    (__dp104_master_state.last_tx_frame_word & UINT32_C(0x40ffffff)) |
+                    ((uint32_t)(i + 1u) << 24) |
+                    (i + 1u == frame_length ? UINT32_C(0x80000000) : 0);
             master_irq_leave(NULL, saved);
             break;
         }
@@ -339,6 +354,41 @@ static int master_send_usb(void *context, uintptr_t port,
                                 payload, length);
 }
 
+/* This response describes the Master itself, not a PLC acknowledgement.
+ * Caller holds the IRQ guard. Capture the previous slot before superseding it;
+ * use the ordinary persistent response/pump path so USB busy retry and D1
+ * cancellation retain exactly the same ownership rules. */
+static void master_snapshot_locked(uintptr_t port, const uint8_t *report,
+                                   unsigned length)
+{
+    static const uint8_t magic[8] = {'D', 'P', '1', '0', '4', 'M', '4', 0};
+    dp104_master_bridge *bridge = &__dp104_master_state.bridge;
+    uint32_t flags, generation;
+    unsigned i;
+    if(length != DP104_REPORT_BYTES || report[2] == 0 || report[3] != 0)
+        return;
+    for(i = 8; i < DP104_REPORT_BYTES; ++i)
+        if(report[i] != 0) return;
+    flags = (uint32_t)bridge->request_ready |
+            ((uint32_t)bridge->waiting << 1) |
+            ((uint32_t)bridge->response_ready << 2) |
+            ((uint32_t)__dp104_master_state.uart_stream.used << 16);
+    generation = bridge->generation;
+    for(i = 0; i < 8; ++i) bridge->response[i] = report[i];
+    for(i = 0; i < 8; ++i) bridge->response[8 + i] = magic[i];
+    dp104_write32(bridge->response + 16, __dp104_master_state.last_host_frame_word);
+    dp104_write32(bridge->response + 20, __dp104_master_state.last_tx_frame_word);
+    dp104_write32(bridge->response + 24, flags);
+    dp104_write32(bridge->response + 28, generation);
+    bridge->port = port;
+    ++bridge->generation;
+    bridge->expected_op = DP104_MASTER_SNAPSHOT_OP;
+    bridge->expected_transaction = report[2];
+    bridge->request_ready = 0;
+    bridge->waiting = 0;
+    bridge->response_ready = 1;
+}
+
 int dp104_master_host_intercept(uintptr_t opaque_a0, uintptr_t port,
                                 unsigned length)
 {
@@ -381,8 +431,18 @@ int dp104_master_host_intercept(uintptr_t opaque_a0, uintptr_t port,
         dp104_wire_stream_reset(&__dp104_master_state.uart_stream);
         __dp104_master_state.uart_stream_active = 1;
     }
-    (void)dp104_bridge_on_host(&__dp104_master_state.bridge, port, report,
-                               (size_t)length);
+    if(length >= 2 && report[1] == DP104_MASTER_SNAPSHOT_OP)
+        master_snapshot_locked(port, report, length);
+    else
+    {
+        if(length == DP104_REPORT_BYTES && report[3] == 0 &&
+           report[1] <= DP104_OP_COMMIT)
+            __dp104_master_state.last_host_frame_word =
+                (uint32_t)report[1] | ((uint32_t)report[2] << 8) |
+                ((uint32_t)(report[1] == DP104_OP_DATA ? report[4] : 0xffu) << 16);
+        (void)dp104_bridge_on_host(&__dp104_master_state.bridge, port, report,
+                                   (size_t)length);
+    }
     master_irq_leave(NULL, saved);
 
     master_usb_out_rearm(port);

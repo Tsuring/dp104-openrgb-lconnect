@@ -88,10 +88,10 @@ CPU_VMA_START = 0x00100000
 CPU_VMA_END = 0x00300000
 
 FROZEN_INPUTS = {
-    "src/firmware/dp104_master_target.c": "7291e14e28df95d29d20cd7b836423a71dafdaf11f4f1ef03079a346c0e2a809",
+    "src/firmware/dp104_master_target.c": "4692997713b06d8993453cb0b5b8b01584d315ecaf1e050bcd43d8e45d1a7230",
     "src/firmware/dp104_master_target.h": "89226e60ab2ed3453838ebcf2bde7d65b66967ca1088c2c4b4dbc398162a4f10",
     "src/firmware/rv32_task_hook.S": "beb2218bf842d1f7ff0da92f8c5662d37bde9e175e74539b591558694871759e",
-    "src/firmware/dp104_patch_state.h": "5b7dc9623c4785fee531212ed91983a01301cbc4c789b9cab1315e45dd97de31",
+    "src/firmware/dp104_patch_state.h": "3f58f81b822fb8b294b854dfe6f87cb83c871e4527509f86208a688a180a239d",
 }
 
 SOURCE_PATHS = (
@@ -108,6 +108,7 @@ SOURCE_PATHS = (
     "src/firmware/dp104_master_bridge.c",
     "src/firmware/dp104_master_bridge.h",
     "src/firmware/dp104_patch_state.h",
+    "src/firmware/dp104_plc_diagnostic.h",
     "src/firmware/dp104_wire.c",
     "src/firmware/dp104_wire.h",
     "src/firmware/dp104_wire_stream.c",
