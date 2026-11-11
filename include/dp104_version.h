@@ -1,0 +1,11 @@
+#ifndef DP104_VERSION_H
+#define DP104_VERSION_H
+
+#define COMPAT_VERSION_MAJOR 1u
+#define COMPAT_VERSION_MINOR 2u
+#define COMPAT_VERSION_PATCH 1u
+#define COMPAT_VERSION_STRING "1.2.1"
+
+#define APP_INFO_OP 0xf2u
+
+#endif

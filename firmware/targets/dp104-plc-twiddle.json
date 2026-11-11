@@ -1,0 +1,21 @@
+{
+  "target": "DP104 PLC v1.2.0 coefficient reconstruction",
+  "rawImageSha256": "204fee7ef591cc5817aa071a5b806eaf47d849a59833c6e3396f7e4dcd6184b2",
+  "original": {
+    "address": "0x0801cc5c",
+    "words": 2048,
+    "bytes": 8192,
+    "sha256": "ff3363a75641f9329201e1ed38ec0cf58b5a41a48cdda1e035dd1adf175fc103",
+    "cmsisName": "twiddleCoef_1024"
+  },
+  "basis": {
+    "address": "0x0801ec5c",
+    "words": 2048,
+    "bytes": 8192,
+    "sha256": "41bffd6d28b43f3cb146587bf8c4c574e025affc82e7be6fa854b1f59f3b2d16",
+    "cmsisName": "twiddleCoef_rfft_2048"
+  },
+  "mapping": "For k=0..1023, j=4*(k mod 512), sign=(k>=512 ? 0x80000000 : 0); output[2*k]=basis[j+1] XOR sign; output[2*k+1]=basis[j] XOR sign; then output[1025]=0.",
+  "officialReference": "https://github.com/ARM-software/CMSIS_4/blob/f2cad4345783c948ed4a7f5cdb02cdc0856366f1/CMSIS/DSP_Lib/Source/CommonTables/arm_common_tables.c",
+  "boundary": "Exact table-byte identity and reconstruction; placement, all aliases and hardware execution require separate verification."
+}

@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "compatibilityVersion": "1.2.1",
+  "packedFirmwareVersion": "0x00000121",
+  "baseTarget": "targets/dp104-v1.2.0-8k.json",
+  "masterVersion": {
+    "runtimeAddress": "0x20005034",
+    "length": 12,
+    "originalSha256": "f60f4adaea08b61357fcdd701d14f2a28fe838389cacffcc18b93d21b83677ec",
+    "continuation": "0x20005040",
+    "query": "VIA GET_KEYBOARD_VALUE 0x02, value ID 0x04",
+    "encoding": "four-byte big-endian packed major/minor/patch nibbles",
+    "strategy": "Jump to a generated register-preserving leaf, then resume the existing branch."
+  },
+  "usbDescriptorRevisionChanged": false,
+  "plcVersion": {
+    "source": "Authored PLC compatibility application",
+    "operation": "D2 F2 APP_INFO",
+    "responseVersionOffsets": [
+      12,
+      13,
+      14
+    ],
+    "nonceEchoOffsets": [
+      16,
+      32
+    ],
+    "readyFlagOffset": 15,
+    "legacyVendorVersionListPatched": true,
+    "legacyVendorVersionProducer": "Existing PLC D1 reply supplies the packed version cached by the master; the master cache is not replaced.",
+    "legacyReply": {
+      "runtimeAddress": "0x08014436",
+      "length": 2,
+      "originalHex": "2022",
+      "windowStart": "0x0801442a",
+      "windowLength": 50,
+      "windowSha256": "b55b2a6794465f273414e83569c1c8cc0fa5b109aa37ddf1fc3eefaab4098f14",
+      "strategy": "Change only the MOVS r2 low-version-byte immediate; preserve the original UART reply and high byte 0x01."
+    }
+  }
+}

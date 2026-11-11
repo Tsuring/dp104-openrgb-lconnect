@@ -1,0 +1,36 @@
+.local/
+build/
+__pycache__/
+*.pyc
+AGENTS.md
+AGENTS.override.md
+DEPLOYMENT*.md
+*.uf2
+*.bin
+*.zip
+
+# Generated binaries, archives and local credentials
+*.exe
+*.dll
+*.elf
+*.o
+*.obj
+*.a
+*.lib
+*.pdb
+*.map
+*.hex
+*.7z
+*.tar
+*.gz
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Local operational helpers are never published
+operations/
+deploy/
+deployment/

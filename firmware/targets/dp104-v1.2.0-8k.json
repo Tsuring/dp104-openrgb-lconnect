@@ -1,0 +1,44 @@
+{
+  "target": "DP104 v1.2.0 8K master + PLC v1.2.0",
+  "patchImplemented": false,
+  "archiveSha256": "085028be5de18168f47bb9a066f94431b62a658133cb8fb026c0fa0baefb3b91",
+  "master": {
+    "archiveEntry": "DP104_v1.2.0/DP104_master_v1.2.0_8K.uf2",
+    "uf2Sha256": "a08c5f93e181025148aacb3e191b411584e19474b99d54c3819b65a8841e89d5",
+    "rawSha256": "dea1d6b9f1b8dbfa323fb9a74ae3cee93cf0c3ae82b35435bdacfa4748a1ca4d",
+    "family": "0xe560e104",
+    "base": "0x8000",
+    "size": 256000,
+    "resetEntry": "0x14e04",
+    "codeCopySource": ["0x8004", "0x14e04"],
+    "codeCopyDestination": ["0x20000000", "0x2000ce00"],
+    "globalPointer": "0x2000e1b0",
+    "stackPointer": "0x20020000",
+    "viaHandler": "0x200046ee",
+    "viaCommandTable": "0x43ca0",
+    "viaChannelTable": "0x43cf0",
+    "globalBacklightSetter": "0x1c976",
+    "globalBacklightConfig": "0x2000de30",
+    "globalConfigSender": "0x212a8",
+    "fifoWriter": "0x2000716e",
+    "rawHidDescriptor": "0x45a48",
+    "rawHidPayloadBytes": 32
+  },
+  "plc": {
+    "archiveEntry": "DP104_v1.2.0/DP104_plc_v1.2.0.uf2",
+    "uf2Sha256": "f3e8d879461133e10b15b1dd5818af0682acf3917c64ae46916b9ca53d784579",
+    "rawSha256": "204fee7ef591cc5817aa071a5b806eaf47d849a59833c6e3396f7e4dcd6184b2",
+    "family": "0xe560e105",
+    "base": "0x08008000",
+    "size": 103936,
+    "keyOutputBuffer": "0x20002348",
+    "keyOutputSetter": "0x0800dd30",
+    "keyOutputSerializer": "0x0800e9b0"
+  },
+  "limitations": [
+    "Addresses are static analysis findings, not installed hooks or reserved code/RAM allocations.",
+    "Normal master addresses are not interchangeable with this target.",
+    "UF2 structural validation does not prove bootloader acceptance or recovery.",
+    "Physical key order and physical RGB channel semantics remain unverified."
+  ]
+}

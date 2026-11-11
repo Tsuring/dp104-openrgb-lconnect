@@ -1,0 +1,36 @@
+{
+  "schema": "dp104-master-ramcopy-v1",
+  "target": "DP104 master 1.2.0 8K",
+  "rawSha256": "dea1d6b9f1b8dbfa323fb9a74ae3cee93cf0c3ae82b35435bdacfa4748a1ca4d",
+  "firstBootCopy": {
+    "flashStart": 32772,
+    "flashEndExclusive": 33300,
+    "ramStart": 536870912,
+    "ramEndExclusive": 536871440,
+    "bootFunction": 85508,
+    "jumpTarget": 536871262,
+    "bytes": 528,
+    "sha256": "19fc2c6f6b275c05d74de5a927435c234f55b49640ceee11c71b8a775bd5eb37"
+  },
+  "secondRamCopy": {
+    "flashStart": 33300,
+    "flashEndExclusive": 85508,
+    "ramStart": 536871440,
+    "ramEndExclusive": 536923648,
+    "bytes": 52208,
+    "sha256": "082b8d9ce24c977c2df28e2270fb44db9d89de8d8313ddc8eb469a6dc8be7c7b",
+    "copySlot": {
+      "address": 536871266,
+      "bytes": 44,
+      "continuation": 536871310,
+      "sha256": "91ac56511d1f8450fe52d6dc45eedba3b19d7d9cc9cd2875d6c0fb5e934bb7ba"
+    }
+  },
+  "constraints": [
+    "Preserve the first ROM-to-RAM copy and the original clock setup call before the second copy.",
+    "Restore the exact patched original RAM suffix before continuing at 0x2000018e.",
+    "Keep initialized-data copy unchanged; apply heap-break word before the original copy executes.",
+    "Boot decoder and new code storage must stay wholly within the original second-copy flash span.",
+    "Do not treat compression or structural image checks as proof of bootloader acceptance or physical runtime."
+  ]
+}
