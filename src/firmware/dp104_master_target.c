@@ -4,6 +4,8 @@
 #include "dp104_wire.h"
 #include "dp104_wire_stream.h"
 
+#include <string.h>
+
 #define DP104_MASTER_STATE_MAGIC UINT32_C(0x44504d31) /* "DPM1" */
 #define DP104_MASTER_CSR_MASK UINT32_C(0x00000088)
 #define DP104_MASTER_UPDATE_COMMAND 0xd1u
@@ -12,6 +14,9 @@
 #define DP104_MASTER_RAW_REPORT_ADDRESS ((uintptr_t)0x200104c0u)
 #define DP104_MASTER_UART_STATUS_ADDRESS ((uintptr_t)0x40003c0bu)
 #define DP104_MASTER_UART_DATA_ADDRESS ((uintptr_t)0x40003c08u)
+#define DP104_MASTER_UART_RFC_ADDRESS ((uintptr_t)0x40003c0au)
+#define DP104_MASTER_RX_ACCUMULATOR_ADDRESS ((uintptr_t)0x2000df2au)
+#define DP104_MASTER_RX_BUFFER_ADDRESS ((uintptr_t)0x20011fb0u)
 #define DP104_MASTER_UART_LEGACY_ADDRESS ((uintptr_t)0x0001d722u)
 #define DP104_MASTER_USB_IN_ADDRESS ((uintptr_t)0x2000355eu)
 #define DP104_MASTER_USB_OUT_REARM_ADDRESS ((uintptr_t)0x20003736u)
@@ -98,6 +103,60 @@ static const uint8_t *master_static_report(void)
 #endif
 }
 
+static uint8_t master_uart_rfc_read(void)
+{
+#if defined(DP104_MASTER_TARGET_HOST_TEST)
+    return dp104_master_test_uart_rfc();
+#else
+    return *(volatile const uint8_t *)DP104_MASTER_UART_RFC_ADDRESS;
+#endif
+}
+
+static uint16_t master_rx_accumulator_read(void)
+{
+#if defined(DP104_MASTER_TARGET_HOST_TEST)
+    return dp104_master_test_rx_accumulator();
+#else
+    return *(volatile const uint16_t *)DP104_MASTER_RX_ACCUMULATOR_ADDRESS;
+#endif
+}
+
+static uint8_t master_uart_rx_fifo_count(void)
+{
+#if defined(DP104_MASTER_TARGET_HOST_TEST)
+    return dp104_master_test_uart_rx_rfc();
+#else
+    return *(volatile const uint8_t *)DP104_MASTER_UART_RFC_ADDRESS;
+#endif
+}
+
+static uint8_t master_uart_rx_data_read(void)
+{
+#if defined(DP104_MASTER_TARGET_HOST_TEST)
+    return dp104_master_test_uart_rx_data();
+#else
+    return *(volatile const uint8_t *)DP104_MASTER_UART_DATA_ADDRESS;
+#endif
+}
+
+static volatile uint16_t *master_rx_accumulator_pointer(void)
+{
+#if defined(DP104_MASTER_TARGET_HOST_TEST)
+    return dp104_master_test_rx_accumulator_pointer();
+#else
+    return (volatile uint16_t *)DP104_MASTER_RX_ACCUMULATOR_ADDRESS;
+#endif
+}
+
+static volatile uint8_t *master_rx_buffer_pointer(void)
+{
+#if defined(DP104_MASTER_TARGET_HOST_TEST)
+    return dp104_master_test_rx_buffer_pointer();
+#else
+    return (volatile uint8_t *)DP104_MASTER_RX_BUFFER_ADDRESS;
+#endif
+}
+
 static dp104_bridge_hooks master_bridge_hooks(void)
 {
     dp104_bridge_hooks hooks;
@@ -127,6 +186,15 @@ static void master_initialize_locked(void)
     __dp104_master_state.uart_stream_active = 0;
     __dp104_master_state.last_host_frame_word = 0;
     __dp104_master_state.last_tx_frame_word = 0;
+    __dp104_master_state.rx_callback_count = 0;
+    __dp104_master_state.rx_callback_total_bytes = 0;
+    __dp104_master_state.rx_last_callback_length = 0;
+    __dp104_master_state.uart_line_status_events = 0;
+    __dp104_master_state.uart_lsr_bit1_events = 0;
+    __dp104_master_state.last_uart_lsr = 0;
+    __dp104_master_state.rx_snapshot_valid = 0;
+    memset(__dp104_master_state.rx_snapshot_nonce, 0,
+           sizeof(__dp104_master_state.rx_snapshot_nonce));
     ((volatile uint32_t *)&__dp104_master_state.initialized)[0] =
         DP104_MASTER_STATE_MAGIC;
 }
@@ -358,6 +426,127 @@ static int master_send_usb(void *context, uintptr_t port,
  * Caller holds the IRQ guard. Capture the previous slot before superseding it;
  * use the ordinary persistent response/pump path so USB busy retry and D1
  * cancellation retain exactly the same ownership rules. */
+static int master_nonzero_bytes(const uint8_t *bytes, unsigned length)
+{
+    unsigned i;
+    for(i = 0; i < length; ++i)
+        if(bytes[i] != 0u) return 1;
+    return 0;
+}
+
+static int master_zero_bytes(const uint8_t *bytes, unsigned length)
+{
+    unsigned i;
+    for(i = 0; i < length; ++i)
+        if(bytes[i] != 0u) return 0;
+    return 1;
+}
+
+/* Called only for F4 while an original BEGIN/DATA/COMMIT is still pending.
+ * All fields and the stream prefix are frozen before F4 supersedes that slot.
+ * LSR comes from the existing IRQ-side one-read hook; never read the
+ * clear-on-read register here. */
+static void master_freeze_rx_snapshot_locked(const uint8_t *request)
+{
+    dp104_master_patch_state *state = &__dp104_master_state;
+    dp104_master_bridge *bridge = &state->bridge;
+    uint8_t *blob = state->rx_snapshot_blob;
+    uint32_t flags;
+    size_t copy_bytes;
+
+    if(state->rx_snapshot_valid || !bridge->waiting ||
+       bridge->expected_op < DP104_OP_BEGIN ||
+       bridge->expected_op > DP104_OP_COMMIT ||
+       !master_nonzero_bytes(request + 4u, 4u))
+        return;
+
+    memset(blob, 0, DP104_MASTER_RX_SNAPSHOT_BYTES);
+    memcpy(blob, "M6RX", 4u);
+    dp104_write16(blob + 4u, DP104_MASTER_RX_SNAPSHOT_SCHEMA);
+    dp104_write16(blob + 6u, DP104_MASTER_RX_SNAPSHOT_HEADER_BYTES);
+    dp104_write16(blob + 8u, DP104_MASTER_RX_SNAPSHOT_BYTES);
+    dp104_write16(blob + 10u, DP104_MASTER_RX_SNAPSHOT_DATA_BYTES);
+    blob[12] = master_uart_rfc_read();
+    blob[13] = state->uart_stream.dropping;
+    blob[14] = state->uart_stream_active;
+    dp104_write16(blob + 16u, master_rx_accumulator_read());
+    blob[18] = state->last_uart_lsr;
+    dp104_write32(blob + 20u, state->uart_stream.used);
+    dp104_write32(blob + 24u, state->rx_callback_count);
+    dp104_write32(blob + 28u, state->rx_callback_total_bytes);
+    dp104_write32(blob + 32u, state->rx_last_callback_length);
+    dp104_write32(blob + 36u, state->uart_line_status_events);
+    dp104_write32(blob + 40u, state->uart_lsr_bit1_events);
+    dp104_write32(blob + 44u, bridge->generation);
+    dp104_write32(blob + 48u, state->last_host_frame_word);
+    dp104_write32(blob + 52u, state->last_tx_frame_word);
+    flags = (uint32_t)bridge->request_ready |
+            ((uint32_t)bridge->waiting << 1) |
+            ((uint32_t)bridge->response_ready << 2);
+    dp104_write32(blob + 56u, flags);
+    blob[60] = bridge->expected_op;
+    blob[61] = bridge->expected_transaction;
+
+    copy_bytes = state->uart_stream.used;
+    if(copy_bytes > DP104_MASTER_RX_SNAPSHOT_DATA_BYTES)
+        copy_bytes = DP104_MASTER_RX_SNAPSHOT_DATA_BYTES;
+    if(copy_bytes)
+        memcpy(blob + DP104_MASTER_RX_SNAPSHOT_HEADER_BYTES,
+               state->uart_stream.data, copy_bytes);
+    memcpy(state->rx_snapshot_nonce, request + 4u,
+           sizeof(state->rx_snapshot_nonce));
+    state->rx_snapshot_valid = 1u;
+}
+
+/* F6 is strictly local metadata paging. Its response uses the bridge's
+ * persistent USB response slot and is never submitted to send_plc. */
+static void master_rx_snapshot_locked(uintptr_t port, const uint8_t *report,
+                                      unsigned length)
+{
+    dp104_master_bridge *bridge = &__dp104_master_state.bridge;
+    const uint16_t offset = length >= 10u ? dp104_read16(report + 8u) : 0u;
+    uint8_t status = DP104_BAD_REQUEST;
+    uint8_t *response = bridge->response;
+    unsigned i;
+
+    if(length != DP104_REPORT_BYTES)
+        status = DP104_BAD_LENGTH;
+    else if(report[0] != DP104_COMMAND ||
+            report[1] != DP104_MASTER_RX_SNAPSHOT_OP || report[2] == 0u ||
+            report[3] != 0u || !master_nonzero_bytes(report + 4u, 4u) ||
+            !master_zero_bytes(report + 10u, DP104_REPORT_BYTES - 10u) ||
+            offset >= DP104_MASTER_RX_SNAPSHOT_BYTES || (offset % 16u) != 0u)
+        status = DP104_BAD_REQUEST;
+    else if(!__dp104_master_state.rx_snapshot_valid ||
+            report[4] != __dp104_master_state.rx_snapshot_nonce[0] ||
+            report[5] != __dp104_master_state.rx_snapshot_nonce[1] ||
+            report[6] != __dp104_master_state.rx_snapshot_nonce[2] ||
+            report[7] != __dp104_master_state.rx_snapshot_nonce[3])
+        status = DP104_BAD_STATE;
+    else
+        status = DP104_OK;
+
+    for(i = 0; i < DP104_REPORT_BYTES; ++i) response[i] = 0u;
+    response[0] = DP104_COMMAND;
+    response[1] = DP104_MASTER_RX_SNAPSHOT_OP;
+    response[2] = length >= 3u ? report[2] : 0u;
+    response[3] = status;
+    if(length >= 8u) memcpy(response + 4u, report + 4u, 4u);
+    memcpy(response + 8u, "M6RX", 4u);
+    dp104_write16(response + 12u, offset);
+    dp104_write16(response + 14u, DP104_MASTER_RX_SNAPSHOT_BYTES);
+    if(status == DP104_OK)
+        memcpy(response + 16u, __dp104_master_state.rx_snapshot_blob + offset, 16u);
+
+    bridge->port = port;
+    ++bridge->generation;
+    bridge->expected_op = DP104_MASTER_RX_SNAPSHOT_OP;
+    bridge->expected_transaction = response[2];
+    bridge->request_ready = 0;
+    bridge->waiting = 0;
+    bridge->response_ready = 1;
+}
+
 static void master_snapshot_locked(uintptr_t port, const uint8_t *report,
                                    unsigned length)
 {
@@ -369,6 +558,7 @@ static void master_snapshot_locked(uintptr_t port, const uint8_t *report,
         return;
     for(i = 8; i < DP104_REPORT_BYTES; ++i)
         if(report[i] != 0) return;
+    master_freeze_rx_snapshot_locked(report);
     flags = (uint32_t)bridge->request_ready |
             ((uint32_t)bridge->waiting << 1) |
             ((uint32_t)bridge->response_ready << 2) |
@@ -433,6 +623,8 @@ int dp104_master_host_intercept(uintptr_t opaque_a0, uintptr_t port,
     }
     if(length >= 2 && report[1] == DP104_MASTER_SNAPSHOT_OP)
         master_snapshot_locked(port, report, length);
+    else if(length >= 2 && report[1] == DP104_MASTER_RX_SNAPSHOT_OP)
+        master_rx_snapshot_locked(port, report, length);
     else
     {
         if(length == DP104_REPORT_BYTES && report[3] == 0 &&
@@ -447,6 +639,30 @@ int dp104_master_host_intercept(uintptr_t opaque_a0, uintptr_t port,
 
     master_usb_out_rearm(port);
     return 1;
+}
+
+void dp104_master_uart_rda_drain(void)
+{
+    unsigned drained = 0;
+    volatile uint16_t *accumulator = master_rx_accumulator_pointer();
+    volatile uint8_t *buffer = master_rx_buffer_pointer();
+
+    while(drained < 8u)
+    {
+        uint16_t cursor;
+        uint8_t byte;
+
+        /* Leave one byte for the stock UART character-timeout path. With the
+         * FIFO trigger lowered to two, draining the final byte here would
+         * clear the receiver before its existing timeout callback can run. */
+        if(master_uart_rx_fifo_count() <= 1u)
+            break;
+        cursor = *accumulator;
+        byte = master_uart_rx_data_read();
+        buffer[cursor] = byte;
+        *accumulator = (uint16_t)(cursor + 1u);
+        ++drained;
+    }
 }
 
 static int master_stream_next(uint8_t *record, size_t capacity,
@@ -511,6 +727,9 @@ void dp104_master_uart_rx(const uint8_t *bytes, unsigned length)
         master_legacy_uart_rx(bytes, length);
         return;
     }
+    ++__dp104_master_state.rx_callback_count;
+    __dp104_master_state.rx_callback_total_bytes += (uint32_t)length;
+    __dp104_master_state.rx_last_callback_length = (uint32_t)length;
     /* push() checks length before reading bytes. Oversize input clears the
      * bounded FIFO and enters its drop/resynchronization mode. */
     result = dp104_wire_stream_push(&__dp104_master_state.uart_stream,
@@ -540,6 +759,15 @@ void dp104_master_uart_rx(const uint8_t *bytes, unsigned length)
         else
             master_legacy_uart_rx(record, (unsigned)record_length);
     }
+}
+
+void dp104_master_uart_line_status(uint8_t raw_lsr)
+{
+    if(!master_state_initialized()) return;
+    ++__dp104_master_state.uart_line_status_events;
+    __dp104_master_state.last_uart_lsr = raw_lsr;
+    if(raw_lsr & 0x02u)
+        ++__dp104_master_state.uart_lsr_bit1_events;
 }
 
 void dp104_master_task_pump(void)

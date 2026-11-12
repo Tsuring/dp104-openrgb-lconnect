@@ -39,6 +39,19 @@ static uint32_t tx_lengths[160];
 static uint32_t tx_modes[160];
 static unsigned tx_count;
 static int failures;
+static uint32_t fake_dma_flags_value;
+static uint32_t fake_dma_remaining_value = DP104_PLC_RX_DMA_BYTES;
+static uint32_t fake_uart_control_value = 0x10u;
+static uint32_t fake_uart_status_value = 0xd0u;
+static unsigned fake_uart_status_reads, fake_uart_data_reads, fake_dma_irq_enables;
+uint32_t dp104_plc_test_dma_flags(void) { return fake_dma_flags_value; }
+uint32_t dp104_plc_test_dma_remaining(void) { return fake_dma_remaining_value; }
+void dp104_plc_test_dma_clear(uint32_t flags) { fake_dma_flags_value &= ~flags; }
+void dp104_plc_test_dma_enable_irq(void) { ++fake_dma_irq_enables; }
+uint32_t dp104_plc_test_uart_control(void) { return fake_uart_control_value; }
+uint32_t dp104_plc_test_uart_status(void) { ++fake_uart_status_reads; return fake_uart_status_value; }
+uint32_t dp104_plc_test_uart_data(void) { ++fake_uart_data_reads; return 0; }
+
 
 static size_t accepted_uart_extension_size(const uint8_t *bytes, size_t length)
 {
@@ -293,6 +306,8 @@ static int check_irq_balance(void)
 
 static int reset_diagnostic_fixture(void)
 {
+    /* Model the image startup BSS clear before each independent boot fixture. */
+    memset(&__dp104_plc_state, 0, sizeof(__dp104_plc_state));
     memset((void *)dp104_plc_test_key_buffer, 0,
            sizeof(dp104_plc_test_key_buffer));
     dp104_plc_test_dirty = 0;
@@ -708,6 +723,87 @@ static void test_plc_diagnostic(void)
     CHECK(response[3] == DP104_OK && dp104_read16(response + 12) == 48u);
     CHECK(dp104_read32(response + 20) == UINT32_C(0x01680060));
     CHECK(check_irq_balance());
+}
+
+static void test_circular_rx_irq(void)
+{
+    uint8_t request[DP104_REPORT_BYTES], response[DP104_REPORT_BYTES];
+    uint8_t burst[177], wire[DP104_WIRE_BYTES], expected[5][17];
+    uint8_t *legacy;
+    const uint8_t order[3] = {1, 0, 2}, tag[4] = {'U','S','E','R'};
+    unsigned i, j, legacy_count = 0, responses, seen_status, seen_data;
+    CHECK(reset_diagnostic_fixture());
+    CHECK(queue_set_order(0x70, order, tag, DP104_OK));
+    make_request(request, DP104_OP_BEGIN, 0x71);
+    dp104_write16(request + 4, DP104_LED_COUNT);
+    CHECK(send_status_request(request, DP104_OK));
+    make_request(request, DP104_OP_DATA, 0x71);
+    dp104_write16(request + 4, 16); request[6] = 8;
+    memset(request + 7, 0x33, 24);
+    CHECK(dp104_wire_encode(DP104_WIRE_REQUEST, request, sizeof(request), wire, sizeof(wire)));
+    memcpy(burst, wire, sizeof(wire));
+    for(i = 0; i < 5; ++i) {
+        memset(expected[i], 0x80u + i, 17);
+        expected[i][0] = 1; expected[i][1] = (uint8_t)(0x40u + i); expected[i][2] = 14;
+        memcpy(burst + sizeof(wire) + i * 17u, expected[i], 17);
+    }
+    dp104_write16(request + 4, 24); memset(request + 7, 0x66, 24);
+    CHECK(dp104_wire_encode(DP104_WIRE_REQUEST, request, sizeof(request), wire, sizeof(wire)));
+    memcpy(burst + 131, wire, sizeof(wire));
+    responses = tx_count;
+    seen_status = fake_uart_status_reads; seen_data = fake_uart_data_reads;
+    for(i = 0; i < sizeof(burst); ++i) {
+        __dp104_plc_state.rx_dma_buffer[i % DP104_PLC_RX_DMA_BYTES] = burst[i];
+        if((i + 1u) % 64u == 0u || i + 1u == sizeof(burst)) {
+            fake_dma_remaining_value = DP104_PLC_RX_DMA_BYTES - ((i + 1u) % DP104_PLC_RX_DMA_BYTES);
+            fake_dma_flags_value = (i + 1u) % 128u == 0u ? 0x00200000u :
+                                   (i + 1u) % 64u == 0u ? 0x00400000u : 0;
+            if(fake_dma_flags_value) dp104_plc_dma_irq();
+            else dp104_plc_usart_irq();
+            for(j = 0; j < 16; ++j) {
+                unsigned before = __dp104_plc_state.uart_stream.used;
+                legacy = 0; dp104_plc_queue_hook(&legacy);
+                if(legacy) {
+                    CHECK(legacy_count < 5 && legacy[DP104_PLC_QUEUE_DATA_BYTES] == 17);
+                    if(legacy_count < 5) CHECK(memcmp(legacy, expected[legacy_count], 17) == 0);
+                    ++legacy_count;
+                }
+                if(__dp104_plc_state.uart_stream.used == before) break;
+            }
+        }
+    }
+    CHECK(legacy_count == 5 && tx_count == responses + 2u);
+    CHECK(__dp104_plc_state.receiver.received[2] == 0xff &&
+          __dp104_plc_state.receiver.received[3] == 0xff);
+    CHECK(__dp104_plc_state.uart_stream.used == 0);
+    CHECK(fake_uart_status_reads == seen_status + 2u && fake_uart_data_reads == seen_data + 1u);
+    CHECK(dp104_wire_decode(DP104_WIRE_RESPONSE, tx_frames[tx_count-1], tx_lengths[tx_count-1], response, sizeof(response)));
+    CHECK(response[1] == DP104_OP_DATA && response[2] == 0x71 && response[3] == DP104_OK);
+    /* Repeated IDLE must not duplicate buffered bytes or acknowledgements. */
+    dp104_plc_usart_irq(); CHECK(__dp104_plc_state.uart_stream.used == 0);
+    CHECK(tx_count == responses + 2u);
+    fake_uart_control_value = 0;
+    seen_status = fake_uart_status_reads; seen_data = fake_uart_data_reads;
+    dp104_plc_usart_irq();
+    CHECK(fake_uart_status_reads == seen_status && fake_uart_data_reads == seen_data);
+    fake_uart_control_value = 0x10u;
+    __dp104_plc_state.diagnostic.armed = 1;
+    fake_dma_flags_value = 0x00600000u; fake_dma_remaining_value = 100;
+    dp104_plc_dma_irq();
+    CHECK(__dp104_plc_state.diagnostic.reserved0 & 2u);
+    CHECK(__dp104_plc_state.uart_stream.used == 0 && __dp104_plc_state.uart_stream.dropping);
+    CHECK(tx_count == responses + 2u && fake_dma_flags_value == 0);
+    /* A fresh boot may receive bytes after BSS but before app entry. */
+    memset(&__dp104_plc_state, 0, sizeof(__dp104_plc_state));
+    __dp104_plc_state.uart_stream.used = 2;
+    __dp104_plc_state.uart_stream.data[0] = 1;
+    __dp104_plc_state.uart_stream.data[1] = 0x44;
+    __dp104_plc_state.rx_dma_cursor.consumed = 28;
+    CHECK(dp104_plc_target_init());
+    CHECK(__dp104_plc_state.uart_stream.used == 2 &&
+          __dp104_plc_state.uart_stream.data[1] == 0x44 &&
+          __dp104_plc_state.rx_dma_cursor.consumed == 28);
+    CHECK(__dp104_plc_state.diagnostic.reserved0 == 1u && fake_dma_irq_enables > 0);
 }
 
 static void test_rx128_mixed_burst(void)
@@ -1155,6 +1251,7 @@ int main(void)
 
     test_plc_diagnostic();
     test_rx128_mixed_burst();
+    test_circular_rx_irq();
 
     CHECK(queue_pops > 0);
     CHECK(check_irq_balance());

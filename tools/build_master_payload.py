@@ -71,6 +71,20 @@ TASK_LEGACY_ENTRY = 0x20001A56
 UART_CALLBACK_PAIR = 0x0001B40E
 UART_CALLBACK_BYTES = 8
 UART_CALLBACK_OLD = 0x0001D722
+UART_LINE_SITE = 0x20007166
+UART_LINE_BYTES = 8
+UART_LINE_ORIGINAL = bytes.fromhex("8347570073002030")
+UART_RDA_SITE = 0x20007062
+UART_RDA_BYTES = 8
+UART_RDA_ORIGINAL = bytes.fromhex("83d6a1d783458700")
+UART_FCR_SITE = 0x000237EE
+UART_FCR_BYTES = 4
+UART_FCR_ORIGINAL = bytes.fromhex("93e7070c")
+UART_FCR_REPLACEMENT = bytes.fromhex("93e70704")  # ORI a5,a5,0x40: trigger2
+UART_FCR_INIT_SITE = 0x000237CE
+UART_FCR_INIT_BYTES = 4
+UART_FCR_INIT_ORIGINAL = bytes.fromhex("930770f8")  # Original literal 0x87
+UART_FCR_INIT_REPLACEMENT = bytes.fromhex("93077004")  # Literal 0x47: same low bits, trigger2
 
 DATA_LMA_START = 0x45880
 DATA_LMA_END = 0x465D0
@@ -88,10 +102,10 @@ CPU_VMA_START = 0x00100000
 CPU_VMA_END = 0x00300000
 
 FROZEN_INPUTS = {
-    "src/firmware/dp104_master_target.c": "4692997713b06d8993453cb0b5b8b01584d315ecaf1e050bcd43d8e45d1a7230",
-    "src/firmware/dp104_master_target.h": "89226e60ab2ed3453838ebcf2bde7d65b66967ca1088c2c4b4dbc398162a4f10",
+    "src/firmware/dp104_master_target.c": "c974c16de18e6085f3d3a88818e0f199c6e00a39c2a4f3a30d5b9875ccb3fd0a",
+    "src/firmware/dp104_master_target.h": "31caa0028b631362ffae036a37e6591fa32ea0a55f84c92073fe6e63e2317f4b",
     "src/firmware/rv32_task_hook.S": "beb2218bf842d1f7ff0da92f8c5662d37bde9e175e74539b591558694871759e",
-    "src/firmware/dp104_patch_state.h": "3f58f81b822fb8b294b854dfe6f87cb83c871e4527509f86208a688a180a239d",
+    "src/firmware/dp104_patch_state.h": "3b9beff1924423fb76bddfd254372c7911b8fda24052f54b95f3f9c6a506337f",
 }
 
 SOURCE_PATHS = (
@@ -109,6 +123,7 @@ SOURCE_PATHS = (
     "src/firmware/dp104_master_bridge.h",
     "src/firmware/dp104_patch_state.h",
     "src/firmware/dp104_plc_diagnostic.h",
+    "src/firmware/dp104_dma_rx.h",
     "src/firmware/dp104_wire.c",
     "src/firmware/dp104_wire.h",
     "src/firmware/dp104_wire_stream.c",
@@ -121,6 +136,7 @@ SOURCE_PATHS = (
     "src/firmware/rv32_task_hook.S",
     "firmware/targets/dp104-v1.2.0-8k.json",
     "firmware/targets/dp104-master-ramcopy.json",
+    "firmware/targets/dp104-master-uart.json",
     "firmware/compatibility.json",
     "include/dp104_protocol.h",
     "include/dp104_version.h",
@@ -449,6 +465,28 @@ dp104_master_taskcall_patch:
 dp104_master_uart_callback_pair:
     lla a0, dp104_master_uart_rx
 
+    .section .uart_line_entry,"ax",@progbits
+    .balign 2
+    .globl dp104_master_uart_line_entry_patch
+dp104_master_uart_line_entry_patch:
+    jal zero, dp104_master_uart_line_hook
+    .word 0x00000013
+
+    .section .uart_rda_entry,"ax",@progbits
+    .balign 2
+    .globl dp104_master_uart_rda_entry_patch
+dp104_master_uart_rda_entry_patch:
+    jal zero, dp104_master_uart_rda_hook
+    .word 0x00000013
+
+    .section .uart_fcr,"ax",@progbits
+    .balign 2
+    ori a5, a5, 0x40
+
+    .section .uart_fcr_init,"ax",@progbits
+    .balign 2
+    addi a5, zero, 0x47
+
     .option pop
 """
 
@@ -484,6 +522,29 @@ dp104_master_version_hook:
     sh a5, 16(sp)
     jal zero, dp104_master_version_continue
     .size dp104_master_version_hook, .-dp104_master_version_hook
+    .option pop
+
+    .option push
+    .option norvc
+    .option norelax
+    .section .text.dp104_master_uart_line_hook,"ax",@progbits
+    .balign 2
+    .globl dp104_master_uart_line_hook
+    .type dp104_master_uart_line_hook,@function
+dp104_master_uart_line_hook:
+    lbu a0, 5(a4)
+    call dp104_master_uart_line_status
+    mret
+    .size dp104_master_uart_line_hook, .-dp104_master_uart_line_hook
+
+    .section .text.dp104_master_uart_rda_hook,"ax",@progbits
+    .balign 2
+    .globl dp104_master_uart_rda_hook
+    .type dp104_master_uart_rda_hook,@function
+dp104_master_uart_rda_hook:
+    call dp104_master_uart_rda_drain
+    mret
+    .size dp104_master_uart_rda_hook, .-dp104_master_uart_rda_hook
     .option pop
 """
 
@@ -588,6 +649,10 @@ PHDRS
   post_bss PT_LOAD FLAGS(5);
   taskcall PT_LOAD FLAGS(5);
   uart_callback PT_LOAD FLAGS(5);
+  uart_line_entry PT_LOAD FLAGS(5);
+  uart_rda_entry PT_LOAD FLAGS(5);
+  uart_fcr PT_LOAD FLAGS(5);
+  uart_fcr_init PT_LOAD FLAGS(5);
   ram_code PT_LOAD FLAGS(5);
 {helper_phdr}}}
 SECTIONS
@@ -598,12 +663,18 @@ SECTIONS
   .post_bss 0x{POST_BSS_SITE:x} : {{ KEEP(*(.post_bss)) }} :post_bss
   .taskcall 0x{TASK_CALL_SITE:x} : {{ KEEP(*(.taskcall)) }} :taskcall
   .uart_callback 0x{UART_CALLBACK_PAIR:x} : {{ KEEP(*(.uart_callback)) }} :uart_callback
+  .uart_line_entry 0x{UART_LINE_SITE:x} : {{ KEEP(*(.uart_line_entry)) }} :uart_line_entry
+  .uart_rda_entry 0x{UART_RDA_SITE:x} : {{ KEEP(*(.uart_rda_entry)) }} :uart_rda_entry
+  .uart_fcr 0x{UART_FCR_SITE:x} : {{ KEEP(*(.uart_fcr)) }} :uart_fcr
+  .uart_fcr_init 0x{UART_FCR_INIT_SITE:x} : {{ KEEP(*(.uart_fcr_init)) }} :uart_fcr_init
   .ram_code 0x{code_start:x} :
   {{
     KEEP(*(.text.dp104_master_host_hook))
     KEEP(*(.text.dp104_master_task_hook))
     KEEP(*(.text.dp104_master_host_legacy))
     KEEP(*(.text.dp104_master_version_hook))
+    KEEP(*(.text.dp104_master_uart_line_hook))
+    KEEP(*(.text.dp104_master_uart_rda_hook))
     *dp104_master_target.o(.text .text.* .rodata .rodata.* .srodata .srodata.*)
     *dp104_master_bridge.o(.text .text.* .rodata .rodata.* .srodata .srodata.*)
     *dp104_wire.o(.text .text.* .rodata .rodata.* .srodata .srodata.*)
@@ -623,6 +694,10 @@ ASSERT(SIZEOF(.copy_shim) == {COPY_SHIM_BYTES}, "second-copy shim must be exactl
 ASSERT(SIZEOF(.post_bss) == {POST_BSS_BYTES}, "post-BSS patch must be exactly eight bytes")
 ASSERT(SIZEOF(.taskcall) == {TASK_CALL_BYTES}, "task call patch must be one AUIPC/JALR pair")
 ASSERT(SIZEOF(.uart_callback) == {UART_CALLBACK_BYTES}, "UART callback pair must be eight bytes")
+ASSERT(SIZEOF(.uart_line_entry) == {UART_LINE_BYTES}, "UART status detour must be eight bytes")
+ASSERT(SIZEOF(.uart_rda_entry) == {UART_RDA_BYTES}, "UART RDA detour must be eight bytes")
+ASSERT(SIZEOF(.uart_fcr) == {UART_FCR_BYTES}, "UART trigger patch must be four bytes")
+ASSERT(SIZEOF(.uart_fcr_init) == {UART_FCR_INIT_BYTES}, "UART initial trigger literal must be four bytes")
 ASSERT(ADDR(.ram_code) == 0x{code_start:x}, "RAM code is not at measured state end")
 ASSERT(SIZEOF(.ram_code) > 0, "linked RAM code is empty")
 ASSERT(__dp104_master_state == 0x{state_start:x}, "master state address changed")
@@ -722,7 +797,7 @@ def validate_payload_elf(elf_path: Path, code_start: int,
         require(sections.get(name, {"size": 0})["size"] == 0,
                 f"master payload unexpectedly contains {name}")
     expected_addresses = {RAW_HID_SITE, VERSION_SITE, COPY_SHIM_SITE, POST_BSS_SITE,
-                          TASK_CALL_SITE, UART_CALLBACK_PAIR, code_start}
+                          TASK_CALL_SITE, UART_CALLBACK_PAIR, UART_LINE_SITE, UART_RDA_SITE, UART_FCR_SITE, UART_FCR_INIT_SITE, code_start}
     if helper_start is not None:
         expected_addresses.add(helper_start)
     loads = elf["program_headers"]
@@ -751,6 +826,10 @@ def validate_payload_elf(elf_path: Path, code_start: int,
         (".post_bss", POST_BSS_SITE, POST_BSS_BYTES),
         (".taskcall", TASK_CALL_SITE, TASK_CALL_BYTES),
         (".uart_callback", UART_CALLBACK_PAIR, UART_CALLBACK_BYTES),
+        (".uart_line_entry", UART_LINE_SITE, UART_LINE_BYTES),
+        (".uart_rda_entry", UART_RDA_SITE, UART_RDA_BYTES),
+        (".uart_fcr", UART_FCR_SITE, UART_FCR_BYTES),
+        (".uart_fcr_init", UART_FCR_INIT_SITE, UART_FCR_INIT_BYTES),
     )
     windows: dict[str, bytes] = {}
     for name, address, length in expected_sections:
@@ -764,7 +843,7 @@ def validate_payload_elf(elf_path: Path, code_start: int,
                 "flash restore-helper segment is missing or empty")
         windows[".flash_helpers"] = segment_bytes(elf_path.resolve(), helper_load[0])
     for name in ("dp104_master_host_hook", "dp104_master_task_hook",
-                 "dp104_master_uart_rx"):
+                 "dp104_master_uart_rx", "dp104_master_uart_rda_drain"):
         symbol = elf["symbols"].get(name)
         require(symbol is not None and code_start <= symbol["value"] <
                 code_start + len(code), f"required master entry {name} is absent")
@@ -844,6 +923,38 @@ def validate_entry_windows(elf: dict[str, Any], code_start: int,
     require(((struct.unpack_from("<I", task)[0] >> 7) & 31) == 1 and
             ((struct.unpack_from("<I", task, 4)[0] >> 7) & 31) == 1,
             "task call patch does not link through ra")
+    line_hook = symbols["dp104_master_uart_line_hook"]
+    line_status = symbols["dp104_master_uart_line_status"]["value"]
+    line_entry = windows[".uart_line_entry"]
+    require(riscv_jal_target(UART_LINE_SITE, struct.unpack_from("<I", line_entry)[0]) ==
+            line_hook["value"] and struct.unpack_from("<I", line_entry, 4)[0] == 0x00000013,
+            "UART line-status entry must be one JAL plus one NOP")
+    line_offset = line_hook["value"] - code_start
+    require(line_hook["size"] == 16 and 0 <= line_offset and
+            line_offset + 16 <= len(code), "UART status wrapper is outside owned RAM code")
+    line_body = code[line_offset:line_offset + 16]
+    require(struct.unpack_from("<I", line_body)[0] == 0x00574503 and
+            rv_call_target(line_hook["value"] + 4, line_body[4:12]) == line_status and
+            struct.unpack_from("<I", line_body, 12)[0] == 0x30200073,
+            "UART status wrapper must preserve one LBU at a4+5, call the recorder, then MRET")
+    rda_hook = symbols["dp104_master_uart_rda_hook"]
+    rda_drain = symbols["dp104_master_uart_rda_drain"]["value"]
+    rda_entry = windows[".uart_rda_entry"]
+    require(riscv_jal_target(UART_RDA_SITE, struct.unpack_from("<I", rda_entry)[0]) ==
+            rda_hook["value"] and struct.unpack_from("<I", rda_entry, 4)[0] == 0x00000013,
+            "UART RDA entry must be one JAL plus one NOP")
+    rda_offset = rda_hook["value"] - code_start
+    require(rda_hook["size"] == 12 and 0 <= rda_offset and rda_offset + 12 <= len(code),
+            "UART RDA wrapper is outside owned RAM code")
+    rda_body = code[rda_offset:rda_offset + 12]
+    require(rv_call_target(rda_hook["value"], rda_body[:8]) == rda_drain and
+            struct.unpack_from("<I", rda_body, 8)[0] == 0x30200073,
+            "UART RDA wrapper must call bounded RFC drain then MRET")
+    require(windows[".uart_fcr"] == UART_FCR_REPLACEMENT and
+            struct.unpack("<I", windows[".uart_fcr"])[0] == 0x0407E793 and
+            windows[".uart_fcr_init"] == UART_FCR_INIT_REPLACEMENT and
+            struct.unpack("<I", windows[".uart_fcr_init"])[0] == 0x04700793,
+            "UART FCR must initialize 0x47 and preserve trigger2 with ORI a5,a5,0x40")
     callback = windows[".uart_callback"]
     require(rv_pair_target(UART_CALLBACK_PAIR, callback) == uart_rx and
             ((struct.unpack_from("<I", callback)[0] >> 7) & 31) == 10,
@@ -889,6 +1000,19 @@ def validate_entry_windows(elf: dict[str, Any], code_start: int,
         "post_bss_helper_target": code_helper,
         "task_call_target": task_hook,
         "uart_callback_target": uart_rx,
+        "uart_line_status": {"site": UART_LINE_SITE, "hook": line_hook["value"],
+                             "recorder": line_status, "single_original_lsr_read": True,
+                             "wrapper_sha256": sha256(line_body)},
+        "uart_receive_policy": {"rda_site": UART_RDA_SITE, "rda_hook": rda_hook["value"],
+                                "drain": rda_drain, "max_fifo_reads_per_irq": 8,
+                                "wrapper_sha256": sha256(rda_body),
+                                "fcr_site": UART_FCR_SITE,
+                                "fcr_replacement_hex": windows[".uart_fcr"].hex(),
+                                "initial_fcr_site": UART_FCR_INIT_SITE,
+                                "initial_fcr_literal_hex": windows[".uart_fcr_init"].hex(),
+                                "trigger_reference_bytes": 2,
+                                "rda_keeps_one_fifo_byte": True,
+                                "legacy_timeout_callback_unchanged": True},
         "host_legacy_trampoline": {"address": legacy["value"],
                                    "length": legacy["size"],
                                    "bytes_sha256": sha256(legacy_bytes),
@@ -1063,7 +1187,8 @@ def apply_planner_recipes(raw: bytes, patched: bytearray, plan: dict[str, Any],
 
 
 def pack_suffix(raw: bytes, raw_base: int, rawhid_patch: bytes,
-                version_patch: bytes) -> tuple[bytes, bytes, dict[str, Any]]:
+                version_patch: bytes, uart_line_patch: bytes | None = None,
+                uart_rda_patch: bytes | None = None) -> tuple[bytes, bytes, dict[str, Any]]:
     suffix_offset = SUFFIX_FLASH_START - raw_base
     suffix_end = SUFFIX_FLASH_END - raw_base
     suffix = bytearray(raw[suffix_offset:suffix_end])
@@ -1085,6 +1210,24 @@ def pack_suffix(raw: bytes, raw_base: int, rawhid_patch: bytes,
             len(version_patch) == VERSION_BYTES,
             "original firmware-version window or replacement size changed")
     suffix[version_relative:version_relative + VERSION_BYTES] = version_patch
+    line_relative = None
+    if uart_line_patch is not None:
+        line_offset = image_offset("master", UART_LINE_SITE, UART_LINE_BYTES, raw)
+        line_relative = line_offset - suffix_offset
+        require(0 <= line_relative and line_relative + UART_LINE_BYTES <= len(suffix) and
+                bytes(suffix[line_relative:line_relative + UART_LINE_BYTES]) == UART_LINE_ORIGINAL and
+                len(uart_line_patch) == UART_LINE_BYTES,
+                "UART status source window or replacement length changed")
+        suffix[line_relative:line_relative + UART_LINE_BYTES] = uart_line_patch
+    rda_relative = None
+    if uart_rda_patch is not None:
+        rda_offset = image_offset("master", UART_RDA_SITE, UART_RDA_BYTES, raw)
+        rda_relative = rda_offset - suffix_offset
+        require(0 <= rda_relative and rda_relative + UART_RDA_BYTES <= len(suffix) and
+                bytes(suffix[rda_relative:rda_relative + UART_RDA_BYTES]) == UART_RDA_ORIGINAL and
+                len(uart_rda_patch) == UART_RDA_BYTES,
+                "UART RDA source window or replacement length changed")
+        suffix[rda_relative:rda_relative + UART_RDA_BYTES] = uart_rda_patch
     patched_suffix = bytes(suffix)
     packed = pack_lz(patched_suffix)
     require(unpack_lz(packed, len(patched_suffix)) == patched_suffix,
@@ -1103,6 +1246,10 @@ def pack_suffix(raw: bytes, raw_base: int, rawhid_patch: bytes,
         "rawhid_replacement_sha256": sha256(rawhid_patch),
         "version_source_offset": version_relative,
         "version_replacement_sha256": sha256(version_patch),
+        "uart_line_status_source_offset": line_relative,
+        "uart_line_status_replacement_sha256": sha256(uart_line_patch) if uart_line_patch is not None else None,
+        "uart_rda_source_offset": rda_relative,
+        "uart_rda_replacement_sha256": sha256(uart_rda_patch) if uart_rda_patch is not None else None,
         "compatibility_version": RELEASE_VERSION,
         "packed_bytes": len(packed),
         "packed_sha256": sha256(packed),
@@ -1542,6 +1689,22 @@ def verify_original_windows(raw: bytes, ramcopy: dict[str, Any],
     require(rv_pair_target(UART_CALLBACK_PAIR, callback) == UART_CALLBACK_OLD and
             ((struct.unpack_from("<I", callback)[0] >> 7) & 31) == 10,
             "original UART constructor no longer builds a0=0x1d722")
+    line_offset, line_original = read_ram_window(raw, UART_LINE_SITE, UART_LINE_BYTES)
+    require(line_original == UART_LINE_ORIGINAL,
+            "original UART line-status read/MRET window changed")
+    uart_reference = load_json(ROOT / "firmware/targets/dp104-master-uart.json")
+    require(uart_reference["rawSha256"] == EXPECTED_RAW_SHA256 and
+            int(uart_reference["lineStatusEntry"], 0) == UART_LINE_SITE and
+            uart_reference["lineStatusBytes"] == UART_LINE_ORIGINAL.hex(),
+            "UART status register-map evidence belongs to another target")
+    rda_offset, rda_original = read_ram_window(raw, UART_RDA_SITE, UART_RDA_BYTES)
+    require(rda_original == UART_RDA_ORIGINAL, "original UART fixed-seven RDA entry changed")
+    fcr_offset = image_offset("master", UART_FCR_SITE, UART_FCR_BYTES, raw)
+    require(raw[fcr_offset:fcr_offset + UART_FCR_BYTES] == UART_FCR_ORIGINAL,
+            "original UART FCR trigger ORI changed")
+    fcr_init_offset = image_offset("master", UART_FCR_INIT_SITE, UART_FCR_INIT_BYTES, raw)
+    require(raw[fcr_init_offset:fcr_init_offset + UART_FCR_INIT_BYTES] == UART_FCR_INIT_ORIGINAL,
+            "original UART initial FCR literal changed")
     decode_rvc_host_prologue(hid)
     return {
         "second_copy_slot": {"raw_file_offset": copy_slot_offset,
@@ -1563,6 +1726,14 @@ def verify_original_windows(raw: bytes, ramcopy: dict[str, Any],
         "task_call": {"raw_file_offset": task_offset,
                       "original_target": TASK_LEGACY_ENTRY,
                       "bytes_sha256": sha256(task)},
+        "uart_line_status": {"raw_file_offset": line_offset, "address": UART_LINE_SITE,
+                             "original_hex": line_original.hex()},
+        "uart_rda": {"raw_file_offset": rda_offset, "address": UART_RDA_SITE,
+                     "original_hex": rda_original.hex()},
+        "uart_fcr": {"raw_file_offset": fcr_offset, "address": UART_FCR_SITE,
+                     "original_hex": UART_FCR_ORIGINAL.hex()},
+        "uart_fcr_initial": {"raw_file_offset": fcr_init_offset, "address": UART_FCR_INIT_SITE,
+                             "original_hex": UART_FCR_INIT_ORIGINAL.hex()},
         "uart_callback_constructor": {"raw_file_offset": callback_offset,
                                        "original_target": UART_CALLBACK_OLD,
                                        "bytes_sha256": sha256(callback)},
@@ -1630,10 +1801,18 @@ def apply_payload_patches(raw: bytes, raw_base: int, plan: dict[str, Any],
         (".taskcall", TASK_CALL_SITE, TASK_CALL_BYTES, "task-hook call pair"),
         (".uart_callback", UART_CALLBACK_PAIR, UART_CALLBACK_BYTES,
          "UART callback constructor pair"),
+        (".uart_fcr", UART_FCR_SITE, UART_FCR_BYTES, "UART receive trigger bits"),
+        (".uart_fcr_init", UART_FCR_INIT_SITE, UART_FCR_INIT_BYTES, "UART initial FIFO trigger literal"),
     ):
         offset = image_offset("master", address, size, raw)
         before = raw[offset:offset + size]
         after = windows[section_name]
+        if section_name == ".uart_fcr":
+            require(before == UART_FCR_ORIGINAL and after == UART_FCR_REPLACEMENT,
+                    "UART receive trigger source or replacement changed before apply")
+        if section_name == ".uart_fcr_init":
+            require(before == UART_FCR_INIT_ORIGINAL and after == UART_FCR_INIT_REPLACEMENT,
+                    "UART receive trigger initial literal changed before apply")
         patches.append(apply_raw_patch(raw, patched, offset, before, after,
                                        label, approved))
 
@@ -1717,7 +1896,8 @@ def run_build(archive_path: Path, zig_path: Path,
 
     rawhid_patch = code_windows[".rawhid_entry"]
     packed_suffix, patched_suffix, packed_report = pack_suffix(
-        raw, raw_base, rawhid_patch, code_windows[".version_entry"])
+        raw, raw_base, rawhid_patch, code_windows[".version_entry"], code_windows[".uart_line_entry"],
+        code_windows[".uart_rda_entry"])
     layout_report = pack_layout(packed_suffix, code)
     code_lma = layout_report["code_lma"]
     helper_start = layout_report["helper_lma"]

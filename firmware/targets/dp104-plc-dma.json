@@ -1,0 +1,28 @@
+{
+  "targetRawSha256": "204fee7ef591cc5817aa071a5b806eaf47d849a59833c6e3396f7e4dcd6184b2",
+  "hardwareIdentity": "Exact fitted MCU is unconfirmed; register/IRQ contract matches pinned vendor code and the referenced Artery-compatible definitions",
+  "dmaBase": "0x40020000",
+  "rxChannel": 6,
+  "rxControl": "0x4002006c",
+  "rxRemaining": "0x40020070",
+  "rxMemory": "0x40020078",
+  "txControlPreserved": "0x40020080",
+  "halfFlag": "0x00400000",
+  "completeFlag": "0x00200000",
+  "circularHtTcEnableMask": "0x27",
+  "dmaIrq": 16,
+  "dmaVectorAddress": "0x08008080",
+  "dmaOriginalVector": "0x0801a67d",
+  "usartIrq": 38,
+  "usartOriginalVectorAddress": "0x080080d8",
+  "usartIsrEntry": "0x08017564",
+  "usartBase": "0x40004400",
+  "reference": {
+    "repository": "ArteryTek/AT32F403A_407_Firmware_Library",
+    "commit": "29f8bfd95b190fa38070d2e0fbbb9f3871b0b3f5",
+    "dmaHeaderUrl": "https://raw.githubusercontent.com/ArteryTek/AT32F403A_407_Firmware_Library/29f8bfd95b190fa38070d2e0fbbb9f3871b0b3f5/libraries/drivers/inc/at32f403a_407_dma.h",
+    "dmaHeaderSha256": "12e536a0841705d68c9aa86d2d0152c2f43bf35986d4627eb5aed1047d4e05f4",
+    "cmsisHeaderUrl": "https://github.com/ArteryTek/AT32F403A_407_CMSIS_Driver/blob/main/at32f403a_407.h"
+  },
+  "verificationBoundary": "Static compatible register/IRQ contract; not silicon identification, real IRQ execution or timing proof"
+}

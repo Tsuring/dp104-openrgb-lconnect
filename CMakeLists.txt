@@ -51,8 +51,13 @@ add_test(NAME wire_records COMMAND test_wire)
 add_executable(test_usb_stage tests/test_usb_stage.c)
 target_link_libraries(test_usb_stage PRIVATE dp104_master_bridge)
 add_test(NAME usb_staging_lifetime COMMAND test_usb_stage)
+add_executable(test_dma_rx tests/test_dma_rx.c
+    src/firmware/dp104_dma_rx.c src/firmware/dp104_wire.c)
+target_include_directories(test_dma_rx PRIVATE include src/firmware)
+add_test(NAME circular_dma_rx_cursor COMMAND test_dma_rx)
 add_executable(test_plc_target tests/test_plc_target.c
-    src/firmware/dp104_plc_target.c src/firmware/dp104_plc_diagnostic.c)
+    src/firmware/dp104_plc_target.c src/firmware/dp104_plc_diagnostic.c
+    src/firmware/dp104_dma_rx.c)
 target_compile_definitions(test_plc_target PRIVATE DP104_PLC_HOST_TEST=1)
 target_link_libraries(test_plc_target PRIVATE dp104_receiver dp104_master_bridge dp104_twiddle)
 add_test(NAME plc_target_binding COMMAND test_plc_target)
@@ -62,6 +67,8 @@ target_link_libraries(test_master_target PRIVATE dp104_master_bridge)
 add_test(NAME master_target_binding COMMAND test_master_target)
 
 # Compile against an external OpenRGB tree without changing or launching it.
+option(DP104_CAPTURE_FAILURE_DIAGNOSTICS
+       "Enable one-shot DP104 failure evidence capture in the OpenRGB adapter" OFF)
 set(DP104_OPENRGB_SOURCE "" CACHE PATH "OpenRGB source tree for adapter compilation")
 if(DP104_OPENRGB_SOURCE)
     if(NOT EXISTS "${DP104_OPENRGB_SOURCE}/RGBController/RGBController.h")
@@ -83,6 +90,10 @@ if(DP104_OPENRGB_SOURCE)
         "${DP104_OPENRGB_SOURCE}/dependencies/json"
         "${DP104_OPENRGB_SOURCE}/dependencies/libusb-1.0.27/include"
         "${DP104_HIDAPI_INCLUDE}")
+    if(DP104_CAPTURE_FAILURE_DIAGNOSTICS)
+        target_compile_definitions(dp104_openrgb_adapter PRIVATE
+            DP104_CAPTURE_FAILURE_DIAGNOSTICS=1)
+    endif()
     add_executable(test_host_hid tests/test_host.cpp src/openrgb/Dp104HidTransport.cpp)
     target_link_libraries(test_host_hid PRIVATE dp104_host)
     target_include_directories(test_host_hid PRIVATE src/openrgb "${DP104_HIDAPI_INCLUDE}")
@@ -94,6 +105,22 @@ if(DP104_OPENRGB_SOURCE)
     target_include_directories(test_controller PRIVATE
         tests/stubs src/openrgb "${DP104_HIDAPI_INCLUDE}")
     add_test(NAME controller_lifecycle COMMAND test_controller)
+    add_executable(test_failure_capture_default tests/test_failure_capture.cpp
+        src/openrgb/Dp104HidTransport.cpp)
+    target_link_libraries(test_failure_capture_default PRIVATE dp104_host)
+    target_include_directories(test_failure_capture_default PRIVATE
+        src/openrgb "${DP104_HIDAPI_INCLUDE}")
+    target_compile_definitions(test_failure_capture_default PRIVATE
+        DP104_TEST_OPENRGB_HID=1 DP104_CAPTURE_FAILURE_DIAGNOSTICS=0)
+    add_test(NAME failure_capture_default_behavior COMMAND test_failure_capture_default)
+    add_executable(test_failure_capture tests/test_failure_capture.cpp
+        src/openrgb/Dp104HidTransport.cpp)
+    target_link_libraries(test_failure_capture PRIVATE dp104_host)
+    target_include_directories(test_failure_capture PRIVATE
+        src/openrgb "${DP104_HIDAPI_INCLUDE}")
+    target_compile_definitions(test_failure_capture PRIVATE
+        DP104_TEST_OPENRGB_HID=1 DP104_CAPTURE_FAILURE_DIAGNOSTICS=1)
+    add_test(NAME failure_capture_diagnostics COMMAND test_failure_capture)
     if(MSVC)
         target_compile_definitions(dp104_openrgb_adapter PRIVATE NOMINMAX)
         target_compile_options(dp104_openrgb_adapter PRIVATE /W4)
@@ -121,7 +148,7 @@ if(Python3_Interpreter_FOUND)
 endif()
 
 if(MSVC)
-    foreach(target test_calibration test_plc_target test_master_target)
+    foreach(target test_calibration test_plc_target test_master_target test_dma_rx)
         target_compile_options(${target} PRIVATE /W4 /WX)
     endforeach()
     target_compile_options(dp104_receiver PRIVATE /W4 /WX)
@@ -138,8 +165,12 @@ if(MSVC)
     target_compile_options(dp104_host PRIVATE /W4 /WX)
     target_compile_options(test_host PRIVATE /W4 /WX)
     target_compile_options(test_end_to_end PRIVATE /W4 /WX)
+    if(TARGET test_failure_capture_default)
+        target_compile_options(test_failure_capture_default PRIVATE /W4 /WX)
+        target_compile_options(test_failure_capture PRIVATE /W4 /WX)
+    endif()
 else()
-    foreach(target test_calibration test_plc_target test_master_target)
+    foreach(target test_calibration test_plc_target test_master_target test_dma_rx)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Werror -pedantic)
     endforeach()
     target_compile_options(dp104_receiver PRIVATE -Wall -Wextra -Werror -pedantic)
@@ -156,4 +187,10 @@ else()
     target_compile_options(dp104_host PRIVATE -Wall -Wextra -Werror -pedantic)
     target_compile_options(test_host PRIVATE -Wall -Wextra -Werror -pedantic)
     target_compile_options(test_end_to_end PRIVATE -Wall -Wextra -Werror -pedantic)
+    if(TARGET test_failure_capture_default)
+        target_compile_options(test_failure_capture_default PRIVATE
+            -Wall -Wextra -Werror -pedantic)
+        target_compile_options(test_failure_capture PRIVATE
+            -Wall -Wextra -Werror -pedantic)
+    endif()
 endif()

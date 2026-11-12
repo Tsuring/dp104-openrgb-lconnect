@@ -1,5 +1,6 @@
 #include "dp104_plc_diagnostic.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #define DIAG_PREFIX_IDLE 0u
@@ -11,6 +12,20 @@
 #define DIAG_HEADER_FLAG_FROZEN 0x0002u
 #define DIAG_HEADER_FLAG_WRAPPED 0x0004u
 #define DIAG_HEADER_FLAG_PREFIX_ACTIVE 0x0008u
+#define DIAG_COUNTER_COUNT 11u
+
+#if defined(_MSC_VER)
+#define DP104_DIAG_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define DP104_DIAG_NOINLINE __attribute__((noinline))
+#else
+#define DP104_DIAG_NOINLINE
+#endif
+
+typedef char dp104_diag_counter_layout_must_be_contiguous[
+    offsetof(dp104_plc_diagnostic, uart_send_calls) ==
+        offsetof(dp104_plc_diagnostic, rx_sequence) +
+            (DIAG_COUNTER_COUNT - 1u) * sizeof(uint32_t) ? 1 : -1];
 
 static void write_le16(uint8_t *bytes, uint16_t value)
 {
@@ -65,7 +80,6 @@ static void append_record(dp104_plc_diagnostic *diagnostic, uint8_t event,
     uint8_t *record;
     uint16_t index;
 
-    if(!diagnostic || !diagnostic->armed || diagnostic->frozen) return;
     index = (uint16_t)(diagnostic->write_index &
                        (DP104_PLC_DIAGNOSTIC_RECORD_CAPACITY - 1u));
     record = diagnostic->records[index];
@@ -92,6 +106,25 @@ static void append_record(dp104_plc_diagnostic *diagnostic, uint8_t event,
         ++diagnostic->record_count;
     else
         diagnostic->ring_wrapped = 1;
+}
+
+static DP104_DIAG_NOINLINE int active_application_request(
+    const dp104_plc_diagnostic *diagnostic,
+    const uint8_t request[DP104_REPORT_BYTES])
+{
+    return diagnostic && request && diagnostic->armed && !diagnostic->frozen &&
+           request[0] == DP104_COMMAND && request[1] <= DP104_OP_COMMIT;
+}
+
+static DP104_DIAG_NOINLINE void append_request_record(
+    dp104_plc_diagnostic *diagnostic,
+    const uint8_t request[DP104_REPORT_BYTES], uint8_t event, uint8_t flags,
+    uint16_t detail, uint8_t value, uint16_t stream_used_before,
+    uint16_t stream_used_after)
+{
+    append_record(diagnostic, event, flags, detail, request[0], request[1],
+                  request[2], value, 7, stream_used_before,
+                  stream_used_after);
 }
 
 static void reset_prefix(dp104_plc_diagnostic *diagnostic)
@@ -165,7 +198,7 @@ static void finish_candidate_if_ready(dp104_plc_diagnostic *diagnostic,
         reset_prefix(diagnostic);
 }
 
-static int note_prefix_byte(dp104_plc_diagnostic *diagnostic, uint8_t byte,
+static DP104_DIAG_NOINLINE int note_prefix_byte(dp104_plc_diagnostic *diagnostic, uint8_t byte,
                             uint16_t stream_used_before,
                             uint16_t stream_used_after)
 {
@@ -346,15 +379,13 @@ void dp104_plc_diagnostic_note_extension(
     uint8_t dropping_after)
 {
     uint8_t flags = DP104_PLC_DIAG_RECORD_D2_FIELDS_COMPLETE;
-    if(!diagnostic || !request || !diagnostic->armed || diagnostic->frozen ||
-       request[0] != DP104_COMMAND || request[1] == DP104_PLC_DIAGNOSTIC_OP ||
-       request[1] > DP104_OP_COMMIT)
+    if(!active_application_request(diagnostic, request))
         return;
     if(dropping_before) flags |= DP104_PLC_DIAG_RECORD_DROPPING_BEFORE;
     if(dropping_after) flags |= DP104_PLC_DIAG_RECORD_DROPPING_AFTER;
-    append_record(diagnostic, DP104_PLC_DIAG_EXTENSION_CONSUMED, flags,
-                  wire_bytes, request[0], request[1], request[2], request[3],
-                  7, stream_used_before, stream_used_after);
+    append_request_record(diagnostic, request,
+        DP104_PLC_DIAG_EXTENSION_CONSUMED, flags, wire_bytes, request[3],
+        stream_used_before, stream_used_after);
 }
 
 void dp104_plc_diagnostic_note_decoded(
@@ -363,8 +394,7 @@ void dp104_plc_diagnostic_note_decoded(
     uint16_t detail = UINT16_MAX;
     uint8_t value;
     uint8_t flags = DP104_PLC_DIAG_RECORD_D2_FIELDS_COMPLETE;
-    if(!diagnostic || !request || !diagnostic->armed || diagnostic->frozen ||
-       request[0] != DP104_COMMAND || request[1] > DP104_OP_COMMIT)
+    if(!active_application_request(diagnostic, request))
         return;
     ++diagnostic->decoded_rgb_frames;
     value = request[3];
@@ -378,58 +408,53 @@ void dp104_plc_diagnostic_note_decoded(
                                     (uint32_t)request[1] |
                                     ((uint32_t)request[2] << 8) |
                                     ((uint32_t)request[3] << 16);
-    append_record(diagnostic, DP104_PLC_DIAG_DECODED_FRAME, flags, detail,
-                  request[0], request[1], request[2], value, 7,
-                  diagnostic->last_stream_used_before,
-                  diagnostic->last_stream_used_after);
+    append_request_record(diagnostic, request, DP104_PLC_DIAG_DECODED_FRAME,
+        flags, detail, value, diagnostic->last_stream_used_before,
+        diagnostic->last_stream_used_after);
 }
 
 void dp104_plc_diagnostic_note_commit(
     dp104_plc_diagnostic *diagnostic, const uint8_t request[DP104_REPORT_BYTES],
     uint8_t status, uint16_t received_leds)
 {
-    if(!diagnostic || !request || !diagnostic->armed || diagnostic->frozen ||
-       request[0] != DP104_COMMAND || request[1] != DP104_OP_COMMIT)
+    if(!active_application_request(diagnostic, request) ||
+       request[1] != DP104_OP_COMMIT)
         return;
     diagnostic->last_commit_word = UINT32_C(0x01000000) |
                                    (uint32_t)request[2] |
                                    ((uint32_t)status << 8) |
                                    ((uint32_t)received_leds << 16);
-    append_record(diagnostic, DP104_PLC_DIAG_COMMIT_RESULT,
-                  DP104_PLC_DIAG_RECORD_D2_FIELDS_COMPLETE,
-                  received_leds, request[0], request[1], request[2], status,
-                  7, diagnostic->last_stream_used_before,
-                  diagnostic->last_stream_used_after);
+    append_request_record(diagnostic, request, DP104_PLC_DIAG_COMMIT_RESULT,
+        DP104_PLC_DIAG_RECORD_D2_FIELDS_COMPLETE, received_leds, status,
+        diagnostic->last_stream_used_before,
+        diagnostic->last_stream_used_after);
 }
 
 void dp104_plc_diagnostic_note_reply(
     dp104_plc_diagnostic *diagnostic, const uint8_t request[DP104_REPORT_BYTES],
     uint8_t status, int encoded, uint16_t wire_bytes)
 {
-    if(!diagnostic || !request || !diagnostic->armed || diagnostic->frozen ||
-       request[0] != DP104_COMMAND || request[1] > DP104_OP_COMMIT)
+    if(!active_application_request(diagnostic, request))
         return;
     ++diagnostic->reply_encode_attempts;
-    append_record(diagnostic, DP104_PLC_DIAG_REPLY_ENCODE,
-                  encoded ? 0 : DP104_PLC_DIAG_RECORD_AMBIGUOUS,
-                  wire_bytes, request[0], request[1], request[2], status, 7,
-                  diagnostic->last_stream_used_before,
-                  diagnostic->last_stream_used_after);
+    append_request_record(diagnostic, request, DP104_PLC_DIAG_REPLY_ENCODE,
+        encoded ? 0 : DP104_PLC_DIAG_RECORD_AMBIGUOUS, wire_bytes, status,
+        diagnostic->last_stream_used_before,
+        diagnostic->last_stream_used_after);
 }
 
 void dp104_plc_diagnostic_note_uart_send(
     dp104_plc_diagnostic *diagnostic, const uint8_t request[DP104_REPORT_BYTES],
     uint8_t status, uint32_t length, uint32_t mode)
 {
-    if(!diagnostic || !request || !diagnostic->armed || diagnostic->frozen ||
-       request[0] != DP104_COMMAND || request[1] > DP104_OP_COMMIT)
+    if(!active_application_request(diagnostic, request))
         return;
     ++diagnostic->uart_send_calls;
-    append_record(diagnostic, DP104_PLC_DIAG_UART_SEND_CALL, 0,
-                  length > UINT16_MAX ? UINT16_MAX : (uint16_t)length,
-                  request[0], request[1], request[2], (uint8_t)mode, 7,
-                  diagnostic->last_stream_used_before,
-                  diagnostic->last_stream_used_after);
+    append_request_record(diagnostic, request,
+        DP104_PLC_DIAG_UART_SEND_CALL, 0,
+        length > UINT16_MAX ? UINT16_MAX : (uint16_t)length,
+        (uint8_t)mode, diagnostic->last_stream_used_before,
+        diagnostic->last_stream_used_after);
     (void)status;
 }
 
@@ -440,37 +465,23 @@ static void arm_logger(dp104_plc_diagnostic *diagnostic)
     diagnostic->write_index = 0;
     diagnostic->record_count = 0;
     diagnostic->ring_wrapped = 0;
-    diagnostic->rx_sequence = 0;
-    diagnostic->rx_bytes = 0;
-    diagnostic->rx_dma_full_callbacks = 0;
-    diagnostic->rx_push_failures = 0;
-    diagnostic->d2_candidates = 0;
-    diagnostic->parser_discard_bytes = 0;
-    diagnostic->decoded_rgb_frames = 0;
-    diagnostic->last_decoded_word = 0;
-    diagnostic->last_commit_word = 0;
-    diagnostic->reply_encode_attempts = 0;
-    diagnostic->uart_send_calls = 0;
-    diagnostic->last_rx_sr_before_dr = 0;
-    diagnostic->last_rx_cndtr_after_dr = 0;
-    diagnostic->last_rx_sample_count = 0;
-    diagnostic->last_rx_length = 0;
-    diagnostic->last_stream_used_before = 0;
-    diagnostic->last_stream_used_after = 0;
-    diagnostic->last_rx_push_failed = 0;
-    memset(diagnostic->snapshot_nonce, 0, sizeof(diagnostic->snapshot_nonce));
-    memset(diagnostic->snapshot_header, 0, sizeof(diagnostic->snapshot_header));
-    reset_prefix(diagnostic);
+    diagnostic->reserved0 &= 1u;
+    memset((uint8_t *)diagnostic + offsetof(dp104_plc_diagnostic, rx_sequence),
+           0, offsetof(dp104_plc_diagnostic, records) -
+              offsetof(dp104_plc_diagnostic, rx_sequence));
 }
 
 static void freeze_snapshot(dp104_plc_diagnostic *diagnostic,
                             const uint8_t nonce[4])
 {
+    const uint8_t *counter_bytes = (const uint8_t *)diagnostic +
+        offsetof(dp104_plc_diagnostic, rx_sequence);
     uint16_t flags = 0;
     uint16_t oldest = diagnostic->record_count ==
                       DP104_PLC_DIAGNOSTIC_RECORD_CAPACITY ?
                       diagnostic->write_index : 0;
     uint8_t *header = diagnostic->snapshot_header;
+    unsigned i;
 
     diagnostic->frozen = 1;
     memcpy(diagnostic->snapshot_nonce, nonce, 4);
@@ -480,6 +491,7 @@ static void freeze_snapshot(dp104_plc_diagnostic *diagnostic,
         flags |= DIAG_HEADER_FLAG_WRAPPED;
     if(diagnostic->prefix_state != DIAG_PREFIX_IDLE)
         flags |= DIAG_HEADER_FLAG_PREFIX_ACTIVE;
+    flags |= (uint16_t)((diagnostic->reserved0 & 3u) << 4);
 
     memset(header, 0, DP104_PLC_DIAGNOSTIC_HEADER_BYTES);
     memcpy(header, "P5LG", 4);
@@ -491,17 +503,12 @@ static void freeze_snapshot(dp104_plc_diagnostic *diagnostic,
     write_le16(header + 14, diagnostic->record_count);
     write_le16(header + 16, flags);
     write_le16(header + 18, oldest);
-    write_le32(header + 20, diagnostic->rx_sequence);
-    write_le32(header + 24, diagnostic->rx_bytes);
-    write_le32(header + 28, diagnostic->rx_dma_full_callbacks);
-    write_le32(header + 32, diagnostic->rx_push_failures);
-    write_le32(header + 36, diagnostic->d2_candidates);
-    write_le32(header + 40, diagnostic->parser_discard_bytes);
-    write_le32(header + 44, diagnostic->decoded_rgb_frames);
-    write_le32(header + 48, diagnostic->last_decoded_word);
-    write_le32(header + 52, diagnostic->last_commit_word);
-    write_le32(header + 56, diagnostic->reply_encode_attempts);
-    write_le32(header + 60, diagnostic->uart_send_calls);
+    for(i = 0; i < DIAG_COUNTER_COUNT; ++i)
+    {
+        uint32_t value;
+        memcpy(&value, counter_bytes + i * sizeof(value), sizeof(value));
+        write_le32(header + 20u + i * sizeof(value), value);
+    }
 }
 
 static void copy_blob_page(const dp104_plc_diagnostic *diagnostic,

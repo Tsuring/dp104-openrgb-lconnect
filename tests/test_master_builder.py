@@ -40,6 +40,10 @@ class MasterBuilderTests(unittest.TestCase):
         self.raw = bytearray([0x55]) * 256000
         self.floor = 0x20013C00
         self.recipes = []
+        fcr_offset = image_offset("master", builder.UART_FCR_SITE, builder.UART_FCR_BYTES, self.raw)
+        self.raw[fcr_offset:fcr_offset + builder.UART_FCR_BYTES] = builder.UART_FCR_ORIGINAL
+        initial_offset = image_offset("master", builder.UART_FCR_INIT_SITE, builder.UART_FCR_INIT_BYTES, self.raw)
+        self.raw[initial_offset:initial_offset + builder.UART_FCR_INIT_BYTES] = builder.UART_FCR_INIT_ORIGINAL
         for address, old, new in (
             (builder.BSS_END_PAIR, rv_address_pair(builder.BSS_END_PAIR, 0x20012A04, 11),
              rv_address_pair(builder.BSS_END_PAIR, self.floor, 11)),
@@ -55,7 +59,9 @@ class MasterBuilderTests(unittest.TestCase):
 
     def compose(self):
         windows = {".copy_shim": bytes([0x11]) * 44, ".post_bss": bytes([0x22]) * 8,
-                   ".taskcall": bytes([0x33]) * 8, ".uart_callback": bytes([0x44]) * 8}
+                   ".taskcall": bytes([0x33]) * 8, ".uart_callback": bytes([0x44]) * 8,
+                   ".uart_fcr": builder.UART_FCR_REPLACEMENT,
+                   ".uart_fcr_init": builder.UART_FCR_INIT_REPLACEMENT}
         plan = {"reservations": {"master": {"newBssEnd": hex(self.floor)}},
                 "reservationRecipesNotApplied": self.recipes}
         patched, _, _ = builder.apply_payload_patches(
@@ -73,9 +79,20 @@ class MasterBuilderTests(unittest.TestCase):
         for name, address in ((".copy_shim", builder.COPY_SHIM_SITE),
                               (".post_bss", builder.POST_BSS_SITE),
                               (".taskcall", builder.TASK_CALL_SITE),
-                              (".uart_callback", builder.UART_CALLBACK_PAIR)):
+                              (".uart_callback", builder.UART_CALLBACK_PAIR),
+                              (".uart_fcr", builder.UART_FCR_SITE),
+                              (".uart_fcr_init", builder.UART_FCR_INIT_SITE)):
             offset = image_offset("master", address, len(windows[name]), patched)
             self.assertEqual(patched[offset:offset + len(windows[name])], windows[name])
+
+    def test_trigger_patch_rejects_changed_constructor(self):
+        for address in (builder.UART_FCR_SITE, builder.UART_FCR_INIT_SITE):
+            with self.subTest(address=hex(address)):
+                offset = image_offset("master", address, 4, self.raw)
+                self.raw[offset] ^= 1
+                with self.assertRaisesRegex(builder.RestoreBuildError, "UART receive trigger"):
+                    self.compose()
+                self.raw[offset] ^= 1
 
     def test_data_check_reads_actual_heap_word_and_rejects_corruption(self):
         patched, _ = self.compose()

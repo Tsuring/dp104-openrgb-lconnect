@@ -1,0 +1,62 @@
+{
+  "target": "DP104 v1.2.0 8K master UART reference and tail-preserving receive correction",
+  "rawSha256": "dea1d6b9f1b8dbfa323fb9a74ae3cee93cf0c3ae82b35435bdacfa4748a1ca4d",
+  "uartBase": "0x40003c00",
+  "irqEntry": "0x2000703e",
+  "receiveReadyEntry": "0x20007062",
+  "receiveTimeoutEntry": "0x20007116",
+  "lineStatusEntry": "0x20007166",
+  "lineStatusBytes": "8347570073002030",
+  "lineStatusOperation": "Read one byte at a4+5, then MRET",
+  "legacyReceiveAccumulator": "0x2000df2a",
+  "legacyReceiveBuffer": "0x20011fb0",
+  "reference": {
+    "url": "https://raw.githubusercontent.com/openwch/ch585/main/EVT/EXAM/SRC/StdPeriphDriver/inc/CH585SFR.h",
+    "gitBlobSha1": "32c2042d2c3432ce272a96b8a5709430bf173a45",
+    "sha256": "8b39699ecae2f1f131f71dac789926b8528fa6ee7152ba236bb2cf0f56bc1e09",
+    "uartFifoBytes": 8,
+    "receiveTriggerMask": "0xc0",
+    "receiveTriggerLevels": [
+      1,
+      2,
+      4,
+      7
+    ],
+    "lineStatusBit1": "receiver overrun in the reference register map"
+  },
+  "evidenceBoundary": {
+    "firmwareInstructionsChecked": true,
+    "exactMcuIdentityConfirmed": false,
+    "physicalOverrunConfirmed": false,
+    "normalReceivePolicyChanged": true,
+    "purpose": "Guard the installed tail-preserving receive correction; bounded real L-Connect acceptance is documented in docs/architecture.md, with exact silicon and prolonged timing still unverified",
+    "rawLineStatusBit1Observed": true
+  },
+  "receiveReadyOriginalBytes": "83d6a1d783458700",
+  "fcrTriggerPatch": {
+    "address": "0x000237ee",
+    "originalHex": "93e7070c",
+    "replacementHex": "93e70704",
+    "operation": "Preserve trigger2 using ORI a5,a5,0x40 after explicit initial0x47",
+    "sourceWindowAddress": "0x000237ea",
+    "sourceWindowHex": "83c726c093e7070c2381f6c0"
+  },
+  "proposedReceivePolicy": {
+    "status": "Installed on the tested unit; seven-minute actual L-Connect observation passed, not an unlimited timing guarantee",
+    "triggerReferenceBytes": 2,
+    "readinessDrain": "Read only while RFC>1, keep one FIFO byte for original four-character timeout delivery; max8 reads perIRQ",
+    "receiveAccumulator": "Reuse original volatile u16 counter and append semantics",
+    "legacyBufferCapacity": "Unknown; no new buffer capacity or allocation is asserted",
+    "timeoutDrainAndCallbackChanged": false,
+    "baudChanged": false,
+    "polling8KChanged": false,
+    "deadlineOrLeaseChanged": false,
+    "timeoutGateReference": "WCH CH585/CH584 V1.5 PDFpage79 section9.3.3"
+  },
+  "fcrInitialLiteralPatch": {
+    "address": "0x000237ce",
+    "originalHex": "930770f8",
+    "replacementHex": "93077004",
+    "operation": "Initialize FCR0x47 instead of0x87, preserving low6bits"
+  }
+}

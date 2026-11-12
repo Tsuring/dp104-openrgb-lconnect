@@ -27,6 +27,9 @@ void dp104_plc_target_poll(void);
 
 /* UART RX callback: bounded copy only; protocol work runs in task context. */
 void dp104_plc_uart_rx(const uint8_t *data, uint32_t length);
+/* Circular RX drains from half/full DMA interrupts and USART IDLE. */
+void dp104_plc_dma_irq(void);
+void dp104_plc_usart_irq(void);
 
 /* Replacement for the stock queue-pop wrapper. Any returned legacy slot is stable. */
 void dp104_plc_queue_hook(uint8_t **out);
@@ -41,6 +44,13 @@ uint32_t dp104_plc_test_irq_save(void);
 void dp104_plc_test_irq_restore(uint32_t primask);
 void dp104_plc_test_legacy_pop(uint8_t **out);
 void dp104_plc_test_uart_send(uint8_t *bytes, uint32_t length, uint32_t mode);
+uint32_t dp104_plc_test_dma_flags(void);
+uint32_t dp104_plc_test_dma_remaining(void);
+void dp104_plc_test_dma_clear(uint32_t flags);
+void dp104_plc_test_dma_enable_irq(void);
+uint32_t dp104_plc_test_uart_status(void);
+uint32_t dp104_plc_test_uart_data(void);
+uint32_t dp104_plc_test_uart_control(void);
 extern volatile uint8_t dp104_plc_test_key_buffer[DP104_FRAME_BYTES];
 extern volatile uint8_t dp104_plc_test_dirty;
 #endif

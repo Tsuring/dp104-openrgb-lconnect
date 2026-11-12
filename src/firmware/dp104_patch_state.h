@@ -8,8 +8,13 @@
 #include "dp104_twiddle.h"
 #include "dp104_plc_diagnostic.h"
 #include "dp104_wire_stream.h"
+#include "dp104_dma_rx.h"
 
 #define DP104_PLC_RX_DMA_BYTES 128u
+#define DP104_MASTER_RX_SNAPSHOT_HEADER_BYTES 64u
+#define DP104_MASTER_RX_SNAPSHOT_DATA_BYTES 256u
+#define DP104_MASTER_RX_SNAPSHOT_BYTES \
+    (DP104_MASTER_RX_SNAPSHOT_HEADER_BYTES + DP104_MASTER_RX_SNAPSHOT_DATA_BYTES)
 
 /* Prospective target-owned storage. No instance is placed by this header.
  * The target planner measures these types with each target compiler. A magic
@@ -23,6 +28,15 @@ typedef struct dp104_master_patch_state {
     uint8_t uart_stream_active;
     uint32_t last_host_frame_word;
     uint32_t last_tx_frame_word;
+    uint32_t rx_callback_count;
+    uint32_t rx_callback_total_bytes;
+    uint32_t rx_last_callback_length;
+    volatile uint32_t uart_line_status_events;
+    volatile uint32_t uart_lsr_bit1_events;
+    volatile uint8_t last_uart_lsr;
+    uint8_t rx_snapshot_valid;
+    uint8_t rx_snapshot_nonce[4];
+    uint8_t rx_snapshot_blob[DP104_MASTER_RX_SNAPSHOT_BYTES];
 } dp104_master_patch_state;
 
 typedef struct dp104_plc_patch_state {
@@ -44,6 +58,8 @@ typedef struct dp104_plc_patch_state {
     /* Separate DMA storage: the vendor's old 72-byte RX area abuts TX RAM.
      * The target planner reserves this array before moving the heap floor. */
     uint8_t rx_dma_buffer[DP104_PLC_RX_DMA_BYTES];
+    /* Preserve the live DMA cursor across the application-entry initializer. */
+    dp104_dma_rx_cursor rx_dma_cursor;
 } dp104_plc_patch_state;
 
 #endif

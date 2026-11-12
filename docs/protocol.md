@@ -66,3 +66,30 @@ The snapshot consists of a 64-byte `P5LG` header and up to 64 chronological 32-b
 The original configurator uses separate vendor queries: master `02 04` and PLC `08 42 64`. The PLC's D1 reply supplies a little-endian packed version to the master's existing display cache. The patched PLC version producer reports `0x0121`; the master display follows that real vendor response rather than a synthetic cache value. The F2 application query independently reports semantic version 1.2.1 with a fresh nonce. These application-version reports are distinct from the USB device descriptor. After an image update, normal USB reconnection and a fresh configurator connection may be needed to discard cached display values.
 
 The wire protocol itself does not allocate flash or RAM; the paired firmware's placement and measured reservations are described in [the architecture record](architecture.md). A test or structurally valid image is not proof of target timing, flash readback or maximum heap/stack demand.
+
+### Circular receive diagnostics
+
+The installed circular receive implementation keeps the 2,112-byte F5 layout and adds header flags `0x10` (circular receive mode) and `0x20` (ambiguous DMA snapshot/overrun since arming). Event 12 records a half-transfer drain, 13 a complete-transfer drain and 14 a rejected ambiguous snapshot; their detail is the observed remaining DMA count, not discarded-byte count. The cursor rejects ambiguous input instead of publishing an incomplete RGB frame. Arming preserves the mode flag and clears the overrun observation.
+
+In circular mode, callback length is the newly consumed span rather than `capacity - CNDTR`; adding length and CNDTR does not infer buffer capacity. DMA interrupts do not read USART SR/DR, and use raw SR zero as an explicit absence of a fresh USART sample. USART IDLE retains the original enable/status gates and adjacent SR/DR clear sequence. The circular implementation is installed on the tested unit; bounded hardware acceptance is recorded in the architecture document.
+
+## Master receive snapshot (F6)
+
+This diagnostic is installed on the tested 8K master. Normal USB enumeration, VIA 12, application version 1.2.1 and the local F6 identity were observed after one authorized copy; the operator confirmed key input and display operation. A subsequent master FIFO correction passed a bounded real L-Connect run; prolonged physical IRQ behavior remains unestablished. F4 retains its existing response format. The first valid F4 received while a BEGIN, DATA or COMMIT is pending freezes a 320-byte snapshot before replacing that pending bridge slot. Idle preflight F4 requests do not freeze it. The snapshot and its four-byte nonce remain immutable until restart.
+
+F6 is master-local and never forwarded to the PLC. Its 32-byte request is `D2 F6 transaction 00`, a nonzero four-byte nonce at 4..7, a little-endian offset at 8..9 and zeros at 10..31. Transactions must be nonzero; offsets are multiples of 16 from 0 through 304. Replies echo command, operation, transaction and nonce, use status at byte 3, `M6RX` at 8..11, offset at 12..13, total size 320 at 14..15, and 16 data bytes at 16..31. BAD_STATE with this identity means no snapshot exists for the nonce; it is not a frame acknowledgement.
+
+The frozen blob uses the following little-endian fields. Reserved bytes are zero.
+
+| Offset | Field |
+| --- | --- |
+| 0..11 | `M6RX`, schema u16=1, header u16=64, total u16=320, data capacity u16=256 |
+| 12..14 | Raw UART receive FIFO count, stream dropping, stream active (one byte each) |
+| 16..18 | Original RX accumulator u16, cached raw line status byte |
+| 20..32 | Stream bytes used, RX callback count, callback byte total, last callback length (u32 each) |
+| 36..40 | Line-status event count and raw bit-1 event count (u32 each) |
+| 44..56 | Original bridge generation, last host word, last TX word, bridge flags (u32 each) |
+| 60..61 | Expected operation and transaction |
+| 64..319 | Up to 256 buffered stream bytes, zero padded |
+
+The line-status instrumentation replaces the pinned original single register read with one read plus a cached-value recorder. F4 does not reread that register. Raw bit 1 is recorded without claiming the exact MCU identity. F6 instrumentation itself preserves the receive policy. The current image additionally applies the separate tail-preserving FIFO correction described in the architecture document; baud rate, deadline and lease remain unchanged. A reader must validate every page, nonce and offset, then correlate the generation and pending request with F4. A reported stream length above capacity remains diagnostic metadata; only the bounded prefix is available. This snapshot cannot prove physical PLC transmission or identify a dropped byte without examining the captured contents.

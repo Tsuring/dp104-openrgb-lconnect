@@ -8,7 +8,7 @@ L-Connect 3 → OpenRGB → DP104 master → PLC → 104 key LEDs
 
 This is an experimental source project for a custom OpenRGB build and a matching patched firmware pair. Stock DP104 firmware does not implement the required protocol. The adapter is compiled into OpenRGB; it is not a loadable plugin or an upstream OpenRGB feature.
 
-**Known issue:** typing-related receive timeouts remain reproducible. The 128-byte RX buffer correction is insufficient for every continuous burst; this is not yet a stable firmware release.
+**Current status:** the tested firmware pair includes circular PLC receive draining and a master UART FIFO correction. A seven-minute real L-Connect observation completed 8,067 additional frames without exchange failures, frame failures or recovery attempts. Typing, short idle/reuse and lighting-option changes were confirmed on the tested unit. Hours-long idle/reuse remains untested; this is experimental firmware, not a general stability guarantee.
 
 ## Features
 
@@ -63,7 +63,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-This checks the adapter API and test bindings; it does not build, launch or install a complete OpenRGB server. The integrated test configuration passed **21/21 CTest cases**. Tests use simulated bindings and do not access USB hardware.
+This checks the adapter API and test bindings; it does not build, launch or install a complete OpenRGB server. The integrated test configuration passed **24/24 CTest cases**. Tests use simulated bindings and do not access USB hardware.
 
 ### Firmware review tools
 
@@ -91,6 +91,8 @@ These execute portable authored code or synthetic callback veneers, not the comp
 
 ## Device tools
 
+Use one HID client at a time. Disconnect the Qwertykeys web configurator, VIA and other keyboard tools while OpenRGB controls the keyboard; concurrent clients can consume each other's replies. Stop DP104 host control before using the configurator or the hardware query tools below.
+
 With the optional Python `hidapi` package installed:
 
 ```sh
@@ -102,22 +104,20 @@ The first command inventories the exact interface; `--query` sends a capability 
 
 ## Validation status
 
-The following results were recorded on the tested unit on **2026-11-11 and 2026-11-12**:
+The latest accepted firmware pair was checked on **2026-11-12**:
 
 | Check | Result |
 | --- | --- |
-| Master/PLC application queries | Both report 1.2.1; end-to-end CAPS and complete-frame ACKs confirmed |
-| Native L-Connect observation | 180 samples over about three minutes; 4,287 additional completed frames, zero frame or exchange failures |
-| RX128 firmware regression (2026-11-12) | 1,286 frames / 19,300 exchanges in 60 seconds; zero retries, foreign reports or failed exchanges; 16 ms maximum observed reply |
-| PLC receive diagnostics | 128-byte capacity observed; zero DMA-full callbacks, FIFO push failures or parser-discard bytes during that run |
-| Follow-up native typing observations | Three new DATA timeouts in one three-minute run; one in a second coupled run; automatic recovery succeeded |
-| No-gap transport stress | Failed after 1,600 frames / 24,011 exchanges; 128-byte DMA-full event and 44 parser-discard bytes captured |
-| Zero-heavy and bare-marker regressions | 248 completed frames each |
-| Native fault tests | Fresh CAPS, newest-frame recovery, retry/window limits and interruptible shutdown passed |
-| Physical confirmation | Wave and color/brightness/speed/direction changes remain active |
-| Existing functions | User confirmed keyboard input, upper display, RAM/GPU/GC575 RGB and 8.8-inch screen/sensors remain normal |
+| Master/PLC application queries | Both report 1.2.1; VIA 12, calibrated end-to-end CAPS and complete-frame ACKs confirmed |
+| Real L-Connect observation | 420 samples over seven minutes; 8,067 additional committed frames, zero exchange failures, frame failures or recovery attempts |
+| Typing and short idle/reuse | User confirmed continuous Wave, normal key input and upper display, including after about one minute idle |
+| L-Connect settings | Color, brightness, speed and left/right direction changes confirmed |
+| Existing integration | After restoring the original native executable and 13 profiles, user confirmed RAM/GPU/GC575 RGB and the 8.8-inch screen with updating sensor values |
+| Source checks | 24/24 CTest cases passed; synthetic ARM/RISC-V checks and guarded image validation passed |
 
-The first native observation above predates the RX128 fix. Later typing tests exposed actual UART receive loss and temporary fallback to the stock effect. Master/PLC diagnostics localized a saturated 72-byte PLC DMA batch and subsequent parser desynchronization. The current PLC source relocates that RX buffer into owned 128-byte storage and updates every RX count/reload site while preserving TX configuration. The post-fix firmware run passed, but a subsequent three-minute native L-Connect observation recorded three additional DATA timeouts and recoveries while completing 4,145 frames. RX128 has not yet established a complete fix for typing-related interruptions. See [the architecture record](docs/architecture.md) for the direct observations, causal inference and remaining limits.
+Increasing the PLC RX buffer to 128 bytes alone did not eliminate continuous-burst loss. The current PLC drains that buffer at half/full-transfer and IDLE boundaries through a shared cursor. A later reply-path capture strongly supported master receive overrun. The master correction reads only available FIFO data in bounded batches and preserves one byte for the original character-timeout callback. The lease, reply deadline and master 8K input remain unchanged. See [the implementation and evidence boundaries](docs/architecture.md).
+
+The accepted run used temporary diagnostic instrumentation and then restored the original native executable. A separate host-side early-zero-read correction is included in this source and passes regression tests, but that normal native candidate has **not been installed or accepted on hardware**. Optional failure capture is disabled by default. The screen startup-log check was inconclusive; subsequent physical confirmation established that sensor values were updating.
 
 Real-time 8K polling, maximum heap/stack demand, flash readback, independent recovery of a corrupted PLC and unlimited runtime are not established. Firmware recovery must be understood before hardware experimentation. Flashing, installation, profile migration and update-maintenance operation scripts are kept outside the published source.
 

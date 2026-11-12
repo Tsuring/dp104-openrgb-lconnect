@@ -25,6 +25,8 @@ DP104_PLC_STATIC_ASSERT(dp104_plc_rx_cndtr_after_sr,
 DP104_PLC_STATIC_ASSERT(dp104_plc_rx_count_after_cndtr,
     offsetof(dp104_plc_patch_state, rx_sample_count) ==
     offsetof(dp104_plc_patch_state, rx_cndtr_after_dr) + sizeof(uint32_t));
+DP104_PLC_STATIC_ASSERT(dp104_plc_fixed_reply_idle_tail,
+    DP104_WIRE_BYTES == 46u && DP104_WIRE_BYTES % 7u != 0u);
 DP104_PLC_STATIC_ASSERT(dp104_plc_rx_buffer_capacity,
     sizeof(((dp104_plc_patch_state *)0)->rx_dma_buffer) == DP104_PLC_UART_DMA_BYTES);
 DP104_PLC_STATIC_ASSERT(dp104_plc_rx_buffer_alignment,
@@ -39,7 +41,9 @@ DP104_PLC_STATIC_ASSERT(dp104_plc_rx_count_target_offset,
 DP104_PLC_STATIC_ASSERT(dp104_plc_rx_buffer_target_offset,
     offsetof(dp104_plc_patch_state, rx_dma_buffer) == 11112u);
 DP104_PLC_STATIC_ASSERT(dp104_plc_rx_owned_target_bytes,
-    sizeof(dp104_plc_patch_state) == 11240u);
+    sizeof(dp104_plc_patch_state) == 11244u);
+DP104_PLC_STATIC_ASSERT(dp104_plc_rx_cursor_target_offset,
+    offsetof(dp104_plc_patch_state, rx_dma_cursor) == 11240u);
 #endif
 
 extern dp104_plc_patch_state __dp104_plc_state;
@@ -63,6 +67,139 @@ static void irq_restore(uint32_t primask)
 #else
     __asm volatile ("msr primask, %0" : : "r"(primask) : "memory");
 #endif
+}
+
+#define DP104_DMA_RX_HALF_FLAG UINT32_C(0x00400000)
+#define DP104_DMA_RX_COMPLETE_FLAG UINT32_C(0x00200000)
+#define DP104_DMA_RX_FLAGS (DP104_DMA_RX_HALF_FLAG | DP104_DMA_RX_COMPLETE_FLAG)
+
+static uint32_t dma_flags(void)
+{
+#ifdef DP104_PLC_HOST_TEST
+    return dp104_plc_test_dma_flags();
+#else
+    return *(const volatile uint32_t *)(uintptr_t)UINT32_C(0x40020000);
+#endif
+}
+
+static uint32_t dma_remaining(void)
+{
+#ifdef DP104_PLC_HOST_TEST
+    return dp104_plc_test_dma_remaining();
+#else
+    return *(const volatile uint32_t *)(uintptr_t)UINT32_C(0x40020070);
+#endif
+}
+
+static void dma_clear(uint32_t flags)
+{
+#ifdef DP104_PLC_HOST_TEST
+    dp104_plc_test_dma_clear(flags);
+#else
+    /* W1C only the observed RX channel HT/TC flags, never TX channel 7. */
+    *(volatile uint32_t *)(uintptr_t)UINT32_C(0x40020004) = flags;
+#endif
+}
+
+static void dma_enable_irq(void)
+{
+#ifdef DP104_PLC_HOST_TEST
+    dp104_plc_test_dma_enable_irq();
+#else
+    volatile uint8_t *priority = (volatile uint8_t *)(uintptr_t)UINT32_C(0xe000e400);
+    priority[16] = priority[38];
+    /* Preserve a pending receive event; the handler validates/clears flags. */
+    *(volatile uint32_t *)(uintptr_t)UINT32_C(0xe000e100) = UINT32_C(1) << 16;
+#endif
+}
+
+static void uart_rx_locked(const uint8_t *data, uint32_t length);
+
+static void dma_emit(void *context, const uint8_t *bytes, size_t length)
+{
+    (void)context;
+    uart_rx_locked(bytes, (uint32_t)length);
+}
+
+/* Caller serializes DMA/USART handlers. The channel stays running in circular
+ * mode: no disable/reload window is introduced while bytes arrive. */
+static void dma_drain_locked(void)
+{
+    dp104_plc_patch_state *state = &__dp104_plc_state;
+    uint32_t before, after, remaining;
+    unsigned attempts = 3;
+    uint8_t events;
+    dp104_dma_rx_result result;
+
+    do {
+        before = dma_flags() & DP104_DMA_RX_FLAGS;
+        remaining = dma_remaining();
+        after = dma_flags() & DP104_DMA_RX_FLAGS;
+    } while(before != after && --attempts);
+    dma_clear(after);
+    state->rx_cndtr_after_dr = remaining;
+    events = (uint8_t)((after & DP104_DMA_RX_HALF_FLAG ?
+                         DP104_DMA_RX_EVENT_HALF : 0u) |
+                      (after & DP104_DMA_RX_COMPLETE_FLAG ?
+                         DP104_DMA_RX_EVENT_COMPLETE : 0u));
+    if(before != after) events = DP104_DMA_RX_EVENT_HALF | DP104_DMA_RX_EVENT_COMPLETE;
+    result = dp104_dma_rx_consume(&state->rx_dma_cursor, state->rx_dma_buffer,
+        DP104_PLC_RX_DMA_BYTES, remaining, events, dma_emit, state);
+    if(result != DP104_DMA_RX_OK)
+    {
+        state->diagnostic.reserved0 |= 2u;
+        state->uart_stream.used = 0;
+        state->uart_stream.dropping = 1;
+    }
+    if(events || result != DP104_DMA_RX_OK)
+        dp104_plc_diagnostic_note_parser(&state->diagnostic,
+            result != DP104_DMA_RX_OK ? DP104_PLC_DIAG_DMA_OVERRUN :
+            events & DP104_DMA_RX_EVENT_COMPLETE ? DP104_PLC_DIAG_DMA_COMPLETE :
+                                                 DP104_PLC_DIAG_DMA_HALF,
+            (uint16_t)remaining, state->uart_stream.used,
+            state->uart_stream.used, state->uart_stream.dropping,
+            state->uart_stream.dropping);
+}
+
+void dp104_plc_dma_irq(void)
+{
+    const uint32_t primask = irq_save();
+    /* DMA interrupts do not read USART SR/DR. Zero means no fresh SR sample. */
+    __dp104_plc_state.rx_sr_before_dr = 0;
+    dma_drain_locked();
+    irq_restore(primask);
+}
+
+void dp104_plc_usart_irq(void)
+{
+    const uint32_t primask = irq_save();
+    uint32_t status, data;
+#ifdef DP104_PLC_HOST_TEST
+    if(!(dp104_plc_test_uart_control() & 0x10u) ||
+       !(dp104_plc_test_uart_status() & 0x10u))
+    {
+        irq_restore(primask);
+        return;
+    }
+    status = dp104_plc_test_uart_status();
+    data = dp104_plc_test_uart_data();
+#else
+    const volatile uint32_t *uart =
+        (const volatile uint32_t *)(uintptr_t)UINT32_C(0x40004400);
+    if(!(uart[3] & 0x10u) || !(uart[0] & 0x10u))
+    {
+        irq_restore(primask);
+        return;
+    }
+    /* Keep the original adjacent SR/DR read-to-clear sequence exactly once. */
+    status = uart[0];
+    data = uart[1];
+#endif
+    (void)data;
+    __dp104_plc_state.rx_sr_before_dr = status;
+    ++__dp104_plc_state.rx_sample_count;
+    dma_drain_locked();
+    irq_restore(primask);
 }
 
 static uint32_t target_millis(void)
@@ -180,13 +317,10 @@ int dp104_plc_target_init(void)
     dp104_output_hooks hooks;
     dp104_plc_patch_state *state = &__dp104_plc_state;
 
-    /* The initializer is called after startup BSS zeroing; publish magic last. */
-    state->initialized = 0;
-    /* BSS startup already zeroed the complete reservation. A peripheral
-     * constructor may have armed RX DMA before this application-entry hook;
-     * preserve any bytes it has already received in the dedicated buffer. */
-    memset(state, 0, offsetof(dp104_plc_patch_state, rx_dma_buffer));
-    dp104_wire_stream_init(&state->uart_stream);
+    /* Startup BSS clearing covers this entire measured reservation. Do not
+     * clear it again after peripherals start: that would erase early ingress
+     * or block half-transfer servicing. This entry is called once after BSS. */
+    state->diagnostic.reserved0 |= 1u;
     if(!dp104_twiddle_rebuild(state->twiddle, DP104_TWIDDLE_WORDS,
                               __dp104_twiddle_basis, DP104_TWIDDLE_WORDS))
         return 0;
@@ -196,6 +330,7 @@ int dp104_plc_target_init(void)
     hooks.publish = publish_frame;
     hooks.release = release_output;
     dp104_receiver_init(&state->receiver, hooks);
+    dma_enable_irq();
     state->initialized = DP104_PLC_TARGET_MAGIC;
     return 1;
 }
@@ -228,10 +363,9 @@ void dp104_plc_target_poll(void)
     poll_at(target_millis());
 }
 
-void dp104_plc_uart_rx(const uint8_t *data, uint32_t length)
+static void uart_rx_locked(const uint8_t *data, uint32_t length)
 {
     dp104_plc_patch_state *state = &__dp104_plc_state;
-    uint32_t primask = irq_save();
     uint16_t stream_used_before = state->uart_stream.used;
     uint8_t push_failed = 0;
 
@@ -246,11 +380,20 @@ void dp104_plc_uart_rx(const uint8_t *data, uint32_t length)
     else
         push_failed = !dp104_wire_stream_push(&state->uart_stream, data, length);
 
-    dp104_plc_diagnostic_on_rx(&state->diagnostic, data, length,
+    /* Circular DMA may overwrite its old span after the copy. Scan the stable
+     * IRQ-owned FIFO copy rather than the live peripheral destination. */
+    dp104_plc_diagnostic_on_rx(&state->diagnostic,
+        !push_failed && length ? state->uart_stream.data + stream_used_before : data, length,
         state->rx_sr_before_dr, state->rx_cndtr_after_dr,
         state->rx_sample_count, stream_used_before,
         state->uart_stream.used, push_failed);
 
+}
+
+void dp104_plc_uart_rx(const uint8_t *data, uint32_t length)
+{
+    const uint32_t primask = irq_save();
+    uart_rx_locked(data, length);
     irq_restore(primask);
 }
 
@@ -534,11 +677,9 @@ static void extension_sink(void *context, const uint8_t *frame, size_t length)
     }
     encoded = dp104_wire_encode(DP104_WIRE_RESPONSE, response,
                                 sizeof(response), reply, sizeof(reply));
-    if(encoded)
-    {
-        encoded_length = dp104_wire_frame_size(reply, sizeof(reply));
-        if(!encoded_length) encoded = 0;
-    }
+    /* Success means the fixed encoder wrote exactly DP104_WIRE_BYTES.
+     * This 46-byte reply never needs the old divisible-by-seven tail padding. */
+    encoded_length = encoded ? sizeof(reply) : 0u;
     if(request[1] <= DP104_OP_COMMIT)
     {
         const uint32_t primask = irq_save();
@@ -548,19 +689,6 @@ static void extension_sink(void *context, const uint8_t *frame, size_t length)
     }
     if(encoded && (reply_length = encoded_length) != 0)
     {
-        /* The master RX ISR drains seven-byte groups and may not signal an
-         * idle tail when a response ends exactly on that boundary. Append a
-         * reserved empty 7D record so the real response is delivered before
-         * the next request. The master stream drops this record, never routing
-         * it to the stock dispatcher. */
-        if(reply_length % 7u == 0u &&
-           reply_length + DP104_WIRE_HEADER_BYTES <= sizeof(reply))
-        {
-            reply[reply_length] = DP104_WIRE_RESPONSE;
-            reply[reply_length + 1u] = DP104_WIRE_TYPE;
-            reply[reply_length + 2u] = 0;
-            reply_length += DP104_WIRE_HEADER_BYTES;
-        }
         /* Use the stock asynchronous contract. The helper first copies into
          * its shared DMA buffer, then records busy=1 so the next caller drains
          * completion and disables the channel before reusing it. Mixing a

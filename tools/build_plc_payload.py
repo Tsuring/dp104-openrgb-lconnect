@@ -21,7 +21,7 @@ from build_data_restore import (
 from build_twiddle_restore import appentry_assembly, thumb_bl_target, verify_appentry_hook
 from verify_target import TARGET, parse_uf2, validate_archive
 from release_version import load_release
-from verify_plc_rx_status import build_rx_status_cpu_test
+from verify_plc_circular_rx import build_circular_rx_cpu_test, verify_usart_irq, target_unity_source
 
 
 OUTPUT_ROOT = ROOT / "build" / "firmware" / "plc-payload"
@@ -38,19 +38,19 @@ QUEUECALL_SITE = 0x08013A5E
 SETTER_SITE = 0x0800DD30
 UART_RX_CALLBACK_WORD = 0x08012BA8
 UART_RX_CALLBACK_OLD = 0x08015BC5
-RX_STATUS_SITE = 0x08017576
-RX_STATUS_ORIGINAL = bytes.fromhex("1a685b68")
+RX_STATUS_SITE = 0x08017564
+RX_STATUS_ORIGINAL = bytes.fromhex("10b5104b")
+DMA_RX_VECTOR = 0x08008080
+DMA_RX_VECTOR_OLD = 0x0801A67D
 RX_STATUS_STATE_OFFSET = 8896
 RX_DMA_BYTES = 128
 RX_DMA_BUFFER_OFFSET = 11112
-RX_DMA_BUFFER_SITES = (0x080175B0, 0x08018930)
+RX_DMA_BUFFER_SITES = (0x08018930,)
 RX_DMA_OLD_BUFFER = 0x2000C7B0
 RX_DMA_TX_COUNT_LITERAL = 0x0801892C
 RX_DMA_COUNT_PATCHES = (
     (0x0801889A, "4ff49003", "4ff40003", "RX DMA initialization count 72 to 128 (packed upper halfword)"),
-    (0x0801757C, "482b", "802b", "RX DMA empty-buffer comparison 72 to 128"),
-    (0x0801758E, "c1f14801", "c1f18001", "RX callback length 128 minus remaining DMA count"),
-    (0x08017598, "4823", "8023", "RX DMA reload count 72 to 128"),
+    (0x080188F6, "42f00102", "42f02702", "RX DMA enable: circular mode plus half/full interrupts, preserve other bits"),
 )
 QUEUE_POP = 0x08018F24
 TABLE_A = 0x0801CC5C
@@ -81,6 +81,10 @@ PROVENANCE_PATHS = (
     "src/firmware/dp104_plc_diagnostic.c",
     "src/firmware/dp104_plc_diagnostic.h",
     "src/firmware/dp104_patch_state.h",
+    "src/firmware/dp104_dma_rx.c",
+    "src/firmware/dp104_dma_rx.h",
+    "tools/verify_plc_circular_rx.py",
+    "tests/test_plc_target.c",
     "src/firmware/dp104_receiver.c",
     "src/firmware/dp104_receiver.h",
     "src/firmware/dp104_wire.c",
@@ -102,6 +106,7 @@ PROVENANCE_PATHS = (
     "firmware/compatibility.json",
     "firmware/targets/dp104-v1.2.0-8k.json",
     "firmware/targets/dp104-plc-twiddle.json",
+    "firmware/targets/dp104-plc-dma.json",
     "build/firmware/hook-plan/plan.json",
     ".local/plc-data-pack-feasibility.json",
     ".local/cmsis4/table-match.json",
@@ -155,23 +160,17 @@ def thumb_modified_immediate(code: bytes) -> int:
 
 
 def verify_rx_count_encodings() -> None:
-    init, compare, length, reload = RX_DMA_COUNT_PATCHES
+    init, enable = RX_DMA_COUNT_PATCHES
     require(init[0] == 0x0801889A and init[1][:4] == init[2][:4] == "4ff4" and
             bytes.fromhex(init[1])[3] == bytes.fromhex(init[2])[3] == 3 and
             thumb_modified_immediate(bytes.fromhex(init[1])) == 72 << 16 and
             thumb_modified_immediate(bytes.fromhex(init[2])) == RX_DMA_BYTES << 16,
             "RX initialization MOV.W does not preserve r3 and the packed count field")
-    require(compare[0] == 0x0801757C and bytes.fromhex(compare[1]) == struct.pack("<H", 0x2b00 | 72) and
-            bytes.fromhex(compare[2]) == struct.pack("<H", 0x2b00 | RX_DMA_BYTES),
-            "RX empty-count CMP does not preserve r3/opcode")
-    require(length[0] == 0x0801758E and length[1][:4] == length[2][:4] == "c1f1" and
-            bytes.fromhex(length[1])[3] == bytes.fromhex(length[2])[3] == 1 and
-            thumb_modified_immediate(bytes.fromhex(length[1])) == 72 and
-            thumb_modified_immediate(bytes.fromhex(length[2])) == RX_DMA_BYTES,
-            "RX length RSB.W does not preserve r1 and its immediate count")
-    require(reload[0] == 0x08017598 and bytes.fromhex(reload[1]) == struct.pack("<H", 0x2300 | 72) and
-            bytes.fromhex(reload[2]) == struct.pack("<H", 0x2300 | RX_DMA_BYTES),
-            "RX reload MOVS does not preserve r3/opcode")
+    require(enable[0] == 0x080188F6 and enable[1][:4] == enable[2][:4] == "42f0" and
+            bytes.fromhex(enable[1])[3] == bytes.fromhex(enable[2])[3] == 2 and
+            thumb_modified_immediate(bytes.fromhex(enable[1])) == 1 and
+            thumb_modified_immediate(bytes.fromhex(enable[2])) == 0x27,
+            "RX enable ORR does not preserve r2 or the reviewed circular/HT/TC mask")
 
 
 def appentry_source() -> str:
@@ -244,7 +243,7 @@ def rx_status_call_source() -> str:
 .type dp104_plc_rxstatuscall_shim,%function
 .thumb_func
 dp104_plc_rxstatuscall_shim:
-    bl dp104_plc_rx_status_hook
+    b.w dp104_plc_usart_irq
 .size dp104_plc_rxstatuscall_shim, .-dp104_plc_rxstatuscall_shim
 """
 
@@ -280,7 +279,8 @@ SECTIONS
   .setter_hook : {{ KEEP(*(.text.dp104_plc_setter_hook)) }} :payload
   .setter_predicate : {{ KEEP(*(.text.dp104_plc_should_skip_setter)) }} :payload
   .setter_legacy ALIGN(4) : {{ KEEP(*(.setter_legacy)) }} :payload
-  .rx_status_hook ALIGN(4) : {{ KEEP(*(.text.dp104_plc_rx_status_hook)) }} :payload
+  .rx_status_hook ALIGN(4) : {{ KEEP(*(.text.dp104_plc_usart_irq)) }} :payload
+  .dma_irq_hook ALIGN(4) : {{ KEEP(*(.text.dp104_plc_dma_irq)) }} :payload
   .core :
   {{
     *(.text .text.*)
@@ -298,7 +298,7 @@ ASSERT(SIZEOF(.appcall) == 4, \"appcall must be one BL\")
 ASSERT(SIZEOF(.queuecall) == 4, \"queuecall must be one BL\")
 ASSERT(SIZEOF(.setterjump) == 4, \"setter site must be one B.W\")
 ASSERT(SIZEOF(.rxstatuscall) == 4, \"RX diagnostic site must be one BL\")
-ASSERT((dp104_plc_rx_status_hook & 0xfffffffe) == ADDR(.rx_status_hook), \"RX diagnostic hook section mismatch\")
+ASSERT((dp104_plc_usart_irq & 0xfffffffe) == ADDR(.rx_status_hook), \"RX diagnostic hook section mismatch\")
 ASSERT(ADDR(.apphook) == 0x{TABLE_A:x}, \"appentry hook is not at A start\")
 ASSERT(ADDR(.apphook) + SIZEOF(.apphook) <= 0x{TABLE_B:x}, \"appentry hook exceeds A table\")
 /* LLD may evaluate this section's extent before relaxation. The exact final
@@ -554,8 +554,16 @@ def planner_contract(plan: dict[str, Any], raw: bytes, raw_sha: str,
                             0x080188A8) == 0x080168FE and
             raw[0x08018934 - raw_base:0x08018938 - raw_base] == struct.pack("<I", 0x4002006c),
             "RX DMA initializer no longer maps packed size+10 and memory+4 to CNDTR/CMAR")
+    dma_contract = load_json(ROOT / "firmware/targets/dp104-plc-dma.json")
+    require(dma_contract["targetRawSha256"] == raw_sha and
+            dma_contract["rxChannel"] == 6 and dma_contract["dmaIrq"] == 16 and
+            int(dma_contract["dmaVectorAddress"], 0) == DMA_RX_VECTOR and
+            int(dma_contract["dmaOriginalVector"], 0) == DMA_RX_VECTOR_OLD and
+            int(dma_contract["rxControl"], 0) == 0x4002006c and
+            int(dma_contract["circularHtTcEnableMask"], 0) == 0x27,
+            "RX DMA register/vector reference contract changed")
     rx_buffer = state_start + RX_DMA_BUFFER_OFFSET
-    require(int(layout["bytes"]) == RX_DMA_BUFFER_OFFSET + RX_DMA_BYTES and
+    require(int(layout["bytes"]) == RX_DMA_BUFFER_OFFSET + RX_DMA_BYTES + 4 and
             rx_buffer % 4 == 0 and rx_buffer + RX_DMA_BYTES <= bss_heap_end,
             "PLC target layout does not reserve the entire aligned RX DMA buffer")
     for address, old_hex, new_hex, purpose in RX_DMA_COUNT_PATCHES:
@@ -700,22 +708,6 @@ def segment_bytes(elf_path: Path, segment: dict[str, Any]) -> bytes:
     return content[start:end]
 
 
-def verify_rx_status_hook(code: bytes, address: int, state_start: int) -> dict[str, Any]:
-    # Exact instructions: aligned 16-byte save; adjacent original SR/DR loads;
-    # stores and a non-flag-setting ADD.W; balanced return. No extra SR/DR read,
-    # C call, IRQ-mask change, or flag-setting instruction is permitted here.
-    expected = bytes.fromhex("13b51a685b6804480260216f4160816801f10101816013bd")
-    require(address % 4 == 0 and len(code) == 28 and code[:24] == expected,
-            "RX diagnostic veneer differs from the reviewed register/flag replay")
-    sample_address = state_start + RX_STATUS_STATE_OFFSET
-    require(code[24:] == struct.pack("<I", sample_address),
-            "RX diagnostic sample literal differs from the reserved C-state offset")
-    return {"address": address, "bytes": len(code), "sample_address": sample_address,
-            "sample_field_offsets": [8896, 8900, 8904],
-            "original_sr_dr_loads_adjacent_once_each": True,
-            "stack_save_bytes": 16, "apsr_and_live_registers_preserved": True,
-            "raw_status_only_no_chip_identity_or_overrun_bit_claim": True}
-
 
 def output_section_bytes(elf: dict[str, Any], elf_path: Path,
                          payload_address: int, name: str) -> tuple[dict[str, Any], bytes]:
@@ -754,11 +746,12 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
             "original UART receive callback literal differs from the pinned vendor target")
     require(raw[RX_STATUS_SITE - raw_base:RX_STATUS_SITE - raw_base + 4] == RX_STATUS_ORIGINAL,
             "RX diagnostic site is not the pinned adjacent SR/DR load pair")
-    require(raw[RX_STATUS_SITE - raw_base - 2:RX_STATUS_SITE - raw_base + 8] ==
-            bytes.fromhex("0d4c1a685b68236f482b") and
-            raw[0x080175A8 - raw_base:0x080175B0 - raw_base] ==
-            struct.pack("<II", 0x40004400, 0x40020000),
-            "RX diagnostic register/USART/DMA context differs from the reviewed ISR")
+    require(raw[0x080175A8 - raw_base:0x080175B0 - raw_base] ==
+            struct.pack("<II", 0x40004400, 0x40020000) and
+            raw[DMA_RX_VECTOR - raw_base:DMA_RX_VECTOR - raw_base + 4] ==
+            struct.pack("<I", DMA_RX_VECTOR_OLD) and
+            raw[DMA_RX_VECTOR_OLD - 1 - raw_base:DMA_RX_VECTOR_OLD + 1 - raw_base] == bytes.fromhex("fee7"),
+            "Pinned USART/DMA context or unused DMA RX vector/default handler changed")
     original_setter = raw[setter_offset:setter_offset + 4]
     require(original_setter == bytes.fromhex(planner["setter_original_hex"]),
             "original setter prologue differs from planner evidence")
@@ -775,12 +768,11 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
         ROOT / "src/firmware/dp104_twiddle.c",
         ROOT / "src/firmware/freestanding_memory.c",
         ROOT / "src/firmware/thumb_setter_hook.S",
-        ROOT / "src/firmware/thumb_rx_status_hook.S",
         private["appentry"], private["appcall"], private["queuecall"],
         private["setterjump"], private["setter_legacy"], private["rxstatuscall"],
     ]
     compile_flags = [
-        "-target", profile["freestanding_triple"], "-std=c99", "-Os", "-g0",
+        "-target", profile["freestanding_triple"], "-std=c99", "-Oz", "-gline-tables-only",
         "-ffreestanding", "-fno-builtin", "-fno-stack-protector", "-fno-common",
         "-fno-pic", "-fno-pie", "-fno-unwind-tables",
         "-fno-asynchronous-unwind-tables", "-ffunction-sections", "-nostdlib",
@@ -788,14 +780,16 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
         "-Isrc/firmware/freestanding", "-Isrc/firmware", "-Iinclude",
         *profile["architecture_flags"],
     ]
-    # Keep receiver, wire and coefficient routines at their established -Os.
-    # The metadata logger and its custom target binding use -Oz and must still
-    # fit the strict original A-table boundary. Vendor code is not recompiled.
+    # Minimize custom C within the unchanged A-table boundary. The vendor
+    # firmware is not recompiled; final ELF/raw bounds remain mandatory.
     diagnostic_flags = ["-Oz" if flag == "-Os" else flag for flag in compile_flags]
     minsize_objects = []
     minsize_reports = []
     for name in ("dp104_plc_diagnostic", "dp104_plc_target"):
         source = ROOT / "src/firmware" / (name + ".c")
+        if name == "dp104_plc_target":
+            source = output_dir / "plc_target_cursor_unity.c"
+            source.write_text(target_unity_source(), encoding="ascii")
         output = output_dir / (name + ".o")
         command = [str(zig), "cc", *diagnostic_flags, "-c", str(source), "-o", str(output)]
         compiled = run(command, env)
@@ -813,7 +807,7 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
         *compile_flags, "-static", "-no-pie", *[str(path) for path in sources],
         *[str(path) for path in minsize_objects],
         "-Wl,-T," + str(private["linker"]), "-Wl,--build-id=none",
-        "-Wl,--no-undefined", "-Wl,-z,max-page-size=0x4", "-o", str(payload_elf),
+        "-Wl,--no-undefined", "-Wl,--gc-sections", "-Wl,-z,max-page-size=0x4", "-o", str(payload_elf),
     ]
     compile_result = run([str(zig), "cc", *flags], env)
     elf = inspect_elf(payload_elf)
@@ -874,8 +868,10 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
     )
     legacy_check = verify_legacy_setter(legacy_bytes, legacy_section["address"],
                                         original_setter)
-    rx_status_check = verify_rx_status_hook(
-        rx_status_bytes, rx_status_section["address"], planner["state_start"])
+    rx_status_check = verify_usart_irq(rx_status_bytes, rx_status_section["address"])
+    dma_irq_section, _dma_irq_bytes = output_section_bytes(elf, payload_elf, TABLE_A, ".dma_irq_hook")
+    dma_irq_pointer = dma_irq_section["address"] | 1
+    require(TABLE_A <= dma_irq_section["address"] < payload_end, "DMA ISR outside owned payload")
     uart_rx_pointer = uart_rx_hook["address"] | 1
     require(TABLE_A <= (uart_rx_pointer & ~1) < payload_end,
             "UART receive callback function lies outside A-span payload")
@@ -893,9 +889,9 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
     require(thumb_wide_target(setterjump_bytes, SETTER_SITE, link=False) ==
             setter_hook["address"],
             "setter-site B.W does not target dp104_plc_setter_hook")
-    require(thumb_bl_target(rxstatuscall_bytes, RX_STATUS_SITE) == rx_status_section["address"],
+    require(thumb_wide_target(rxstatuscall_bytes, RX_STATUS_SITE, False) == rx_status_section["address"],
             "RX diagnostic BL does not target the reviewed status veneer")
-    rx_status_cpu = build_rx_status_cpu_test(zig, env, output_dir, rx_status_bytes)
+    rx_status_cpu = build_circular_rx_cpu_test(zig, env, output_dir)
 
     appcall_bin = output_dir / "appcall.bin"
     queuecall_bin = output_dir / "queuecall.bin"
@@ -933,6 +929,7 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
             "setter_predicate": predicate["address"],
             "setter_legacy": legacy_section["address"],
             "rx_status_hook": rx_status_section["address"],
+            "dma_irq_handler": dma_irq_pointer,
         },
         "static_hook_checks": {
             "appentry": apphook_check,
@@ -946,11 +943,11 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
             "setterjump_target": thumb_wide_target(setterjump_bytes, SETTER_SITE, False),
             "uart_rx_callback_target": uart_rx_pointer & 0xFFFFFFFE,
             "uart_rx_callback_thumb_bit_set": bool(uart_rx_pointer & 1),
-            "rx_status_call_target": thumb_bl_target(rxstatuscall_bytes, RX_STATUS_SITE),
+            "rx_status_call_target": thumb_wide_target(rxstatuscall_bytes, RX_STATUS_SITE, False),
         },
-        "rx_status_synthetic_cpu_test": rx_status_cpu,
+        "circular_rx_synthetic_cpu_test": rx_status_cpu,
         "minsize_compile": minsize_reports,
-        "optimization_boundary": "custom target binding/logger -Oz; receiver/wire/twiddle -Os; vendor code not recompiled",
+        "optimization_boundary": "Custom C -Oz and GC of unreferenced sections; explicit entry/IRQ/callback KEEP roots; vendor code not recompiled",
         "payload_elf": {
             "path": str(payload_elf.relative_to(ROOT)),
             "sha256": sha256_file(payload_elf),
@@ -970,6 +967,7 @@ def build_linked_payload(zig: Path, env: dict[str, str], raw: bytes,
             "setterjump": {"bytes": setterjump_bytes, "path": setterjump_bin},
             "rxstatuscall": {"bytes": rxstatuscall_bytes, "path": rxstatuscall_bin},
             "payload": {"bytes": payload_bytes, "path": payload_bin},
+            "dma_rx_vector": {"bytes": struct.pack("<I", dma_irq_pointer), "old": struct.pack("<I", DMA_RX_VECTOR_OLD)},
             "uart_rx_callback": {
                 "address": UART_RX_CALLBACK_WORD,
                 "bytes": struct.pack("<I", uart_rx_pointer),
@@ -1003,7 +1001,7 @@ def build_raw_replacements(raw: bytes, raw_base: int,
         (APPCALL_SITE, "appcall", "Redirect original startup BL through target initialization"),
         (QUEUECALL_SITE, "queuecall", "Route the task queue pop through the PLC receiver"),
         (SETTER_SITE, "setterjump", "Branch to the guarded setter without changing LR"),
-        (RX_STATUS_SITE, "rxstatuscall", "Replay adjacent SR/DR reads through a register-preserving metadata sampler"),
+        (RX_STATUS_SITE, "rxstatuscall", "Replace USART IDLE ISR entry with the circular RX drain handler"),
         (TABLE_A, "payload", "Replace the original A table prefix with linked read-only code"),
     ):
         new = blobs[name]["bytes"]
@@ -1032,6 +1030,16 @@ def build_raw_replacements(raw: bytes, raw_base: int,
         "artifact": "linker-resolved dp104_plc_uart_rx Thumb pointer",
         "purpose": "Register stream-framing UART receive callback",
     })
+
+    dma_vector = blobs["dma_rx_vector"]
+    vector_offset = DMA_RX_VECTOR - raw_base
+    require(raw[vector_offset:vector_offset + 4] == dma_vector["old"] and
+            len(dma_vector["bytes"]) == 4 and dma_vector["bytes"][0] & 1,
+            "DMA RX vector recipe does not replace the pinned default with a Thumb handler")
+    replacements.append({"address": DMA_RX_VECTOR, "offset": vector_offset,
+        "old": dma_vector["old"], "new": dma_vector["bytes"],
+        "artifact": "linker-resolved dp104_plc_dma_irq Thumb pointer",
+        "purpose": "Handle channel6 half/full receive interrupts before IDLE"})
 
     release = load_release()
     version = int(release["packedFirmwareVersion"], 0)

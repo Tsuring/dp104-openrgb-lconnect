@@ -53,6 +53,7 @@ struct HidStubState
           writeCalls(0),
           closeCalls(0),
           waitOnEmptyRead(false),
+          returnZeroBeforeNextQueuedReport(false),
           nextQueuedReport(0)
     {
         readData.fill(0);
@@ -64,6 +65,7 @@ struct HidStubState
     int writeCalls;
     int closeCalls;
     bool waitOnEmptyRead;
+    bool returnZeroBeforeNextQueuedReport;
     std::size_t nextQueuedReport;
     std::vector<unsigned char> lastWrite;
     std::array<unsigned char, DP104_REPORT_BYTES> readData;
@@ -618,11 +620,56 @@ void TestNativeHidTransportNoMatchTimesOutWithoutResend()
         CHECK(elapsed.count() >= 50);
         CHECK(elapsed.count() < 500);
         CHECK(g_hidStub.writeCalls == 1);
-        CHECK(g_hidStub.readCalls == 4);
+        /* Once zero-byte reads are retried until the real deadline, the
+         * number of empty reads can vary with scheduler and millisecond
+         * rounding. The three queued foreign reports must still be drained. */
+        CHECK(g_hidStub.readCalls >= 4);
+        CHECK(static_cast<std::size_t>(g_hidStub.readCalls) ==
+              g_hidStub.readTimeouts.size());
         CHECK(g_hidStub.nextQueuedReport == 3u);
-        CHECK(g_hidStub.readTimeouts.size() == 4u);
-        CHECK(g_hidStub.readTimeouts.back() >= 1);
-        CHECK(g_hidStub.readTimeouts.back() <= 100);
+        for(const int timeout : g_hidStub.readTimeouts)
+        {
+            CHECK(timeout >= 1);
+            CHECK(timeout <= 100);
+        }
+    }
+    CHECK(g_hidStub.closeCalls == 1);
+}
+
+void TestZeroByteReadBeforeDeadlineKeepsWaitingForAck()
+{
+    hid_device_ device = {13};
+    ResetHidStub();
+    ResetRuntimeStatusCounters();
+
+    const Report request = MakeAck(DP104_OP_DATA, 0x56u);
+    const Report matchingAck = MakeAck(DP104_OP_DATA, 0x56u);
+    g_hidStub.queuedReports.push_back(matchingAck);
+    g_hidStub.returnZeroBeforeNextQueuedReport = true;
+
+    {
+        dp104::openrgb::Dp104HidTransport transport(&device);
+        Report response = {};
+        CHECK(transport.Exchange(request, response));
+        CHECK(response == matchingAck);
+        CHECK(g_hidStub.writeCalls == 1);
+        CHECK(g_hidStub.readCalls == 2);
+        CHECK(static_cast<std::size_t>(g_hidStub.readCalls) ==
+              g_hidStub.readTimeouts.size());
+        for(const int timeout : g_hidStub.readTimeouts)
+        {
+            CHECK(timeout >= 1);
+            CHECK(timeout <= 100);
+        }
+        CHECK(g_hidStub.nextQueuedReport == 1u);
+        CHECK(g_hidStub.readTimeouts.size() == 2u);
+        CHECK(g_hidStub.readTimeouts[0] >= 1 && g_hidStub.readTimeouts[0] <= 100);
+        CHECK(g_hidStub.readTimeouts[1] >= 1 && g_hidStub.readTimeouts[1] <= 100);
+        CHECK(g_dp104RuntimeStatus.exchangeCount.load(std::memory_order_relaxed) == 1u);
+        CHECK(g_dp104RuntimeStatus.exchangeSuccesses.load(std::memory_order_relaxed) == 1u);
+        CHECK(g_dp104RuntimeStatus.exchangeFailures.load(std::memory_order_relaxed) == 0u);
+        CHECK(g_dp104RuntimeStatus.firstFailureState.load(std::memory_order_relaxed) == 0u);
+        transport.Close();
     }
     CHECK(g_hidStub.closeCalls == 1);
 }
@@ -742,7 +789,14 @@ void TestNativeHidTransportPassesCapsAndStockPayloads()
         CHECK(!client.IsReady());
         CHECK(g_hidStub.lastWrite.size() == DP104_REPORT_BYTES + 1u);
         CHECK(g_hidStub.writeCalls == 1);
-        CHECK(g_hidStub.readCalls == 2);
+        CHECK(g_hidStub.readCalls >= 2);
+        CHECK(static_cast<std::size_t>(g_hidStub.readCalls) ==
+              g_hidStub.readTimeouts.size());
+        for(const int timeout : g_hidStub.readTimeouts)
+        {
+            CHECK(timeout >= 1);
+            CHECK(timeout <= 100);
+        }
     }
     CHECK(g_hidStub.closeCalls == 1);
 }
@@ -1042,9 +1096,17 @@ int HID_API_CALL hid_read_timeout(hid_device* device,
         g_hidStub.readTimeouts.push_back(milliseconds);
         if(g_hidStub.nextQueuedReport < g_hidStub.queuedReports.size())
         {
-            queued = g_hidStub.queuedReports[g_hidStub.nextQueuedReport++];
-            hasQueuedReport = true;
-            readResult = DP104_REPORT_BYTES;
+            if(g_hidStub.returnZeroBeforeNextQueuedReport)
+            {
+                g_hidStub.returnZeroBeforeNextQueuedReport = false;
+                readResult = 0;
+            }
+            else
+            {
+                queued = g_hidStub.queuedReports[g_hidStub.nextQueuedReport++];
+                hasQueuedReport = true;
+                readResult = DP104_REPORT_BYTES;
+            }
         }
         else
         {
@@ -1095,6 +1157,7 @@ int main()
     TestNativeHidTransportPayloadLengths();
     TestNativeHidTransportSkipsForeignReports();
     TestNativeHidTransportNoMatchTimesOutWithoutResend();
+    TestZeroByteReadBeforeDeadlineKeepsWaitingForAck();
     TestRuntimeStatusExportLatchesFirstAndLastFailures();
     TestMatchingHidErrorStatusFailsClient();
     TestNativeHidTransportPassesCapsAndStockPayloads();

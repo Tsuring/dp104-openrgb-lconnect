@@ -30,9 +30,10 @@ extern "C" {
  * Frozen header offsets (all multibyte fields little endian):
  *   0 magic "P5LG"; 4 schema u16; 6 header bytes u16; 8 total bytes u16;
  *   10 record bytes u16; 12 capacity u16; 14 valid record count u16;
- *   16 flags u16 (armed=1, frozen=2, wrapped=4, prefix-active=8);
+ *   16 flags u16 (armed=1, frozen=2, wrapped=4, prefix-active=8,
+ *      circular-RX=16, DMA-overrun-observed=32);
  *   18 oldest physical ring index u16;
- *   20 RX callbacks u32; 24 RX bytes u32; 28 length-72 callbacks u32;
+ *   20 RX callbacks u32; 24 RX bytes u32; 28 sampled CNDTR-zero observations u32;
  *   32 push failures u32; 36 D2 prefix candidates u32;
  *   40 parser-discard bytes u32; 44 decoded RGB request count u32;
  *   48 last decoded word u32 (valid bit24, request status bits16..23,
@@ -43,7 +44,8 @@ extern "C" {
  *
  * Record offsets (oldest-to-newest logical order; unused fixed-capacity
  * records are zero): 0 RX sequence u32; 4 sampled RX count u32; 8 raw SR
- * before DR u32; 12 raw CNDTR after DR u32; 16 callback length u16; 18 stream
+ * before DR u32 (zero for DMA-only events); 12 CNDTR sampled for this drain
+ * u32 (after DR for USART); 16 newly delivered span length u16; 18 stream
  * used before push/parser u16; 20 stream used after u16; 22 event detail u16;
  * 24 event code; 25 flags; 26 decoded command; 27 operation; 28 transaction;
  * 29 event value; 30 decoded-prefix byte count; 31 prefix symbols observed
@@ -65,7 +67,10 @@ enum dp104_plc_diagnostic_event {
     DP104_PLC_DIAG_DECODED_FRAME = 8,
     DP104_PLC_DIAG_COMMIT_RESULT = 9,
     DP104_PLC_DIAG_REPLY_ENCODE = 10,
-    DP104_PLC_DIAG_UART_SEND_CALL = 11
+    DP104_PLC_DIAG_UART_SEND_CALL = 11,
+    DP104_PLC_DIAG_DMA_HALF = 12,
+    DP104_PLC_DIAG_DMA_COMPLETE = 13,
+    DP104_PLC_DIAG_DMA_OVERRUN = 14
 };
 
 enum dp104_plc_diagnostic_record_flags {
@@ -88,6 +93,7 @@ typedef struct dp104_plc_diagnostic {
     uint16_t write_index;
     uint16_t record_count;
     uint8_t ring_wrapped;
+    /* Bit0: circular RX; bit1: ambiguous/overrun DMA snapshot since arm. */
     uint8_t reserved0;
 
     uint32_t rx_sequence;
@@ -123,7 +129,9 @@ typedef struct dp104_plc_diagnostic {
                    [DP104_PLC_DIAGNOSTIC_RECORD_BYTES];
 } dp104_plc_diagnostic;
 
-/* Called by dp104_plc_uart_rx after the unchanged wire-stream push attempt. */
+/* Called after copying a new span into the stable IRQ-owned wire FIFO.
+ * In circular mode, length + CNDTR does not imply DMA capacity, and a zero
+ * CNDTR at ordinary completion is not itself proof of overrun or byte loss. */
 void dp104_plc_diagnostic_on_rx(dp104_plc_diagnostic *diagnostic,
                                 const uint8_t *data, uint32_t length,
                                 uint32_t sr_before_dr,

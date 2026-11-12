@@ -277,7 +277,10 @@ def make_plan(raw_images, layout, master_code_bytes=0):
              window("master", 0x0001d722, 12, master, "UART ISR callback; relocation pending"),
              window("plc", 0x0800dd30, 4, plc, "Key setter entry; displaced PC-relative LDR needs relocation"),
              window("plc", 0x08013a5e, 4, plc, "Existing receive-queue call; ABI pending"),
-             window("plc", 0x08017576, 4, plc, "Adjacent USART SR/DR loads; diagnostic replay must preserve registers and flags"),
+             window("plc", 0x08017564, 4, plc, "USART ISR entry redirected to circular RX handler"),
+              window("plc", 0x08008080, 4, plc, "Default DMA1 channel6 vector; Thumb handler only"),
+              window("plc", 0x080188f6, 4, plc, "RX enable ORR: circular mode plus half/full interrupts"),
+              window("plc", 0x08017576, 4, plc, "Adjacent USART SR/DR loads; diagnostic replay must preserve registers and flags"),
              window("plc", 0x0801889a, 4, plc, "RX DMA packed initialization count MOV.W"),
              window("plc", 0x0801757c, 2, plc, "RX DMA empty-count CMP immediate"),
              window("plc", 0x0801758e, 4, plc, "RX DMA callback-length RSB.W immediate"),
@@ -340,6 +343,7 @@ def main():
     plan["inputHashes"] = {role: hashlib.sha256(raw).hexdigest() for role, raw in images.items()}
     plan["sourceHashes"] = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in (Path(__file__), ROOT / "src/firmware/dp104_patch_state.h",
+                                     ROOT / "src/firmware/dp104_dma_rx.h",
                                      ROOT / "src/firmware/dp104_plc_diagnostic.h",
                                      ROOT / "src/firmware/dp104_master_bridge.h",
                                      ROOT / "src/firmware/dp104_receiver.h",
